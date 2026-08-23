@@ -36,3 +36,8 @@ desktop.ini
 
 .claude
 .memsearch
+/.smoke_finetune*/
+.smoke_prune*
+/*_processed_data/
+/trained_ckpts_*/
+/models/*.pth

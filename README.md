@@ -1,3 +1,10 @@
+## Unofficial IndexTTS v2.5 Training Repo
+
+> **Fine-tuning support:** The training feature in this fork is based on
+> [JarodMica/index-tts](https://github.com/JarodMica/index-tts) and was converted
+> to support fine-tuning IndexTTS-2.5 models. See the
+> [fine-tuning guide](docs/FINETUNING_2_5.md) for usage instructions.
+
 <div align="center">
 
 <picture>
@@ -394,6 +401,13 @@ tts.infer(voice, text, 'gen.wav')
 
 For more details, see [README_INDEXTTS_1_5](archive/README_INDEXTTS_1_5.md),
 or visit the IndexTTS1 repository at [index-tts:v1.5.0](https://github.com/index-tts/index-tts/tree/v1.5.0).
+
+## 🛠️ Fine-tuning IndexTTS-2.5
+
+This fork includes an IndexTTS-2.5-aware GPT fine-tuning pipeline and Windows
+batch workflow. See [the fine-tuning guide](docs/FINETUNING_2_5.md) for the
+source manifest format, preprocessing, prompt pairing, training, and checkpoint
+pruning instructions.
 
 ## 📊 Evaluation
 
