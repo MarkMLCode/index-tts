@@ -77,17 +77,22 @@ deepspeed = [
   "deepspeed==0.17.1",
 ]
 # To install the GPT2 acceleration engine, use `uv sync --extra accel` (or `--all-extras`).
-# NOTE: flash-attn 2.8.3.post1 also requires triton at import time on Windows.
+# Official flash-attn only ships Linux wheels. On Windows we pin a community
+# prebuilt for torch 2.8.0+cu128 / CPython 3.11; otherwise setup.py 404s and
+# tries to compile against whatever CUDA_HOME points at.
+# NOTE: flash-attn also requires triton at import time on Windows.
 accel = [
-  "flash-attn==2.8.3.post1",
+  "flash-attn==2.8.3.post1; sys_platform != 'win32'",
+  "flash-attn==2.8.3; sys_platform == 'win32'",
   "nvidia-cuda-runtime-cu12",
   "nvidia-cudnn-cu12",
-  "triton-windows==3.1.0.post17; sys_platform == 'win32'",
+  "triton-windows<3.5; sys_platform == 'win32'",
 ]
 # To install torch.compile support for s2mel, use `uv sync --extra torch_compile` (or `--all-extras`).
 # On Windows this is satisfied by the triton-windows package above.
+# <3.5 stays on the 3.4 line that matches torch 2.8 and supports Blackwell sm_120.
 torch_compile = [
-  "triton-windows==3.1.0.post17; sys_platform == 'win32'",
+  "triton-windows<3.5; sys_platform == 'win32'",
 ]
 test = [
   "pytest>=7.0",
@@ -121,6 +126,10 @@ deepspeed = [{ requirement = "torch", match-runtime = true }]
 flash-attn = [{ requirement = "torch", match-runtime = true }]
 
 [tool.uv.sources]
+# Official Dao-AILab releases have no win_amd64 wheels for this torch/Python combo.
+flash-attn = [
+  { url = "https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.3/flash_attn-2.8.3+cu128torch2.8.0cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl", marker = "sys_platform == 'win32'" },
+]
 # Install PyTorch with CUDA support on Linux/Windows (CUDA doesn't exist for Mac).
 # NOTE: We must explicitly request them as `dependencies` above. These improved
 # versions will not be selected if they're only third-party dependencies.

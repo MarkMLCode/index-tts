@@ -93,6 +93,8 @@ def store_kvcache(
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ):
+    # Must stay a single device kernel: CUDA graph capture forbids host
+    # syncs (torch.any / index_copy masks) and 3.4's ptxas supports sm_120.
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
