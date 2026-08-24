@@ -46,6 +46,15 @@ class GPT2AccelAttention(nn.Module):
             self.num_heads, self.head_dim, scale, self.num_heads
         )
 
+    def _flash_attention_dtype(self, input_dtype: torch.dtype) -> torch.dtype:
+        """Select a FlashAttention dtype that matches the wired KV cache."""
+        cache = self.accel_attn.k_cache
+        if cache.numel() and cache.dtype in (torch.float16, torch.bfloat16):
+            return cache.dtype
+        if input_dtype in (torch.float16, torch.bfloat16):
+            return input_dtype
+        return torch.float16
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -76,14 +85,16 @@ class GPT2AccelAttention(nn.Module):
         k_flat = key.transpose(1, 2).contiguous().view(-1, num_heads, head_dim)
         v_flat = value.transpose(1, 2).contiguous().view(-1, num_heads, head_dim)
 
-        # ensure fp16
-        if q_flat.device.type == "cuda" and q_flat.dtype != torch.float16:
-            orig_dtype = q_flat.dtype
-            q_flat = q_flat.to(torch.float16)
-            k_flat = k_flat.to(torch.float16)
-            v_flat = v_flat.to(torch.float16)
-        else:
-            orig_dtype = q_flat.dtype
+        # FlashAttention requires query/key/value and the KV cache to use the
+        # same low-precision dtype. In particular, RTX 50-series inference uses
+        # bfloat16, so forcing fp16 here makes decode fail against a bf16 cache.
+        orig_dtype = q_flat.dtype
+        if q_flat.device.type == "cuda":
+            attention_dtype = self._flash_attention_dtype(orig_dtype)
+            if q_flat.dtype != attention_dtype:
+                q_flat = q_flat.to(attention_dtype)
+                k_flat = k_flat.to(attention_dtype)
+                v_flat = v_flat.to(attention_dtype)
 
         o_flat = self.accel_attn(q_flat, k_flat, v_flat)  # [B*T, H, D]
 

@@ -23,9 +23,16 @@ class KVCacheBlock:
         self.token_ids = token_ids
 
     def reset(self):
-        self.ref_cnt = 1
+        """Return the block metadata to its unallocated state."""
+        self.ref_cnt = 0
         self._block_hash = None
         self.token_ids = []
+
+    def acquire(self):
+        """Initialize a free block for one active sequence reference."""
+        assert self.ref_cnt == 0
+        self.reset()
+        self.ref_cnt = 1
 
 
 class Seq:
@@ -91,7 +98,10 @@ class KVCacheManager:
         self.used_block_ids: Set[int] = set()
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        cache_dtype = torch.float16 if device == "cuda" else dtype
+        if device == "cuda" and dtype not in (torch.float16, torch.bfloat16):
+            cache_dtype = torch.float16
+        else:
+            cache_dtype = dtype
         self.kv_cache = torch.empty(
             2,
             num_layers,
@@ -117,10 +127,19 @@ class KVCacheManager:
     def _allocate_block(self, block_id: int) -> KVCacheBlock:
         block = self.blocks[block_id]
         assert block.ref_cnt == 0
-        block.reset()
+        block.acquire()
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
         return block
+
+    def reset(self):
+        """Invalidate all prefix-cache metadata and release every KV block."""
+        self.block_hash_to_id.clear()
+        self.used_block_ids.clear()
+        self.free_block_ids.clear()
+        self.free_block_ids.extend(range(self.num_blocks))
+        for block in self.blocks:
+            block.reset()
 
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_cnt == 0

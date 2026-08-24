@@ -1,3 +1,4 @@
+import copy
 import sys
 from typing import List, Optional
 
@@ -70,10 +71,13 @@ class AccelInferenceEngine:
             head_dim=head_dim,
             block_size=block_size,
             num_blocks=num_blocks,
-            dtype=torch.float16,  # Force fp16 for FlashAttention
+            dtype=next(model.parameters()).dtype,
         )
         self.kv_manager.wire_kv_cache_to_model(model)
         self.sampler = Sampler()
+        # Sampling is sensitive to logit rounding. Lazily retain an fp32 copy
+        # of the final norm/head when accelerated inference runs in fp16/bf16.
+        self._lm_head_fp32: Optional[nn.Module] = None
         self.current_sequences = []
         self.graphs = {}
         self.graph_vars = None
@@ -217,6 +221,83 @@ class AccelInferenceEngine:
             temperatures, dtype=torch.float32, pin_memory=True
         ).cuda(non_blocking=True)
         return temperatures
+
+    def _compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Project hidden states in fp32 before applying sampling controls."""
+        if self.lm_head is None:
+            return self.model.compute_logits(hidden.float())
+
+        head_dtype = next(self.lm_head.parameters()).dtype
+        if head_dtype == torch.float32:
+            return self.lm_head(hidden.float())
+
+        if self._lm_head_fp32 is None:
+            self._lm_head_fp32 = copy.deepcopy(self.lm_head).float()
+        return self._lm_head_fp32(hidden.float())
+
+    def _apply_repetition_penalty(
+        self, logits: torch.Tensor, sequences: List[Seq]
+    ) -> torch.Tensor:
+        """Match transformers' repetition-penalty logits processor."""
+        penalty = self._gen_rep_penalty
+        if penalty == 1.0:
+            return logits
+        for row_index, sequence in enumerate(sequences):
+            if not sequence.token_ids:
+                continue
+            token_ids = torch.as_tensor(
+                sequence.token_ids, device=logits.device, dtype=torch.long
+            )
+            row = logits[row_index]
+            scores = row.gather(0, token_ids)
+            scores = torch.where(scores < 0, scores * penalty, scores / penalty)
+            row.scatter_(0, token_ids, scores)
+        return logits
+
+    def _warp_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply temperature, top-k, and top-p in transformers order."""
+        temperature = self._gen_temperature
+        top_k = self._gen_top_k
+        top_p = self._gen_top_p
+
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        if top_k is not None and top_k > 0:
+            keep = min(int(top_k), logits.size(-1))
+            threshold = torch.topk(logits, keep, dim=-1)[0][..., -1, None]
+            logits = logits.masked_fill(logits < threshold, float("-inf"))
+
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(
+                logits, descending=False, dim=-1
+            )
+            cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            sorted_remove = cumulative_probs <= (1.0 - top_p)
+            sorted_remove[..., -1:] = False
+            remove = sorted_remove.scatter(1, sorted_indices, sorted_remove)
+            logits = logits.masked_fill(remove, float("-inf"))
+
+        return logits
+
+    def _sample_tokens(
+        self, logits: torch.Tensor, sequences: List[Seq]
+    ) -> torch.Tensor:
+        """Apply processors/warpers and sample like single-beam HF generation."""
+        logits = self._apply_repetition_penalty(logits.float(), sequences)
+        if not self._gen_do_sample:
+            return logits.argmax(dim=-1)
+        logits = self._warp_logits(logits)
+        probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        noise = torch.empty_like(probabilities).exponential_(1.0)
+        return probabilities.div_(noise).argmax(dim=-1)
+
+    def reset_model_state(self) -> None:
+        """Invalidate state tied to the currently loaded GPT checkpoint."""
+        if self.current_sequences:
+            raise RuntimeError("cannot reset accelerated model state during generation")
+        self.kv_manager.reset()
+        self._lm_head_fp32 = None
 
     def _capture_cuda_graphs(self, tts_mel_embedding=None, tts_text_pos_embedding=None):
         print("Capturing CUDA graphs for decode optimization...")
@@ -380,8 +461,10 @@ class AccelInferenceEngine:
         input_ids: torch.Tensor,
         max_new_tokens: int = 100,
         temperature: float = 1.0,
-        top_k: int = 50,
+        top_k: Optional[int] = 0,
         top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        do_sample: bool = True,
         stop_tokens: Optional[List[int]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         tts_embeddings: Optional[
@@ -406,6 +489,19 @@ class AccelInferenceEngine:
         Returns:
             Generated token IDs [batch_size, total_len]
         """
+        if temperature <= 0:
+            raise ValueError("temperature must be greater than zero")
+        if top_p is not None and not 0.0 <= top_p <= 1.0:
+            raise ValueError("top_p must be between zero and one")
+        if repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be greater than zero")
+
+        self._gen_temperature = float(temperature)
+        self._gen_top_k = top_k
+        self._gen_top_p = top_p
+        self._gen_rep_penalty = float(repetition_penalty)
+        self._gen_do_sample = bool(do_sample)
+
         batch_size = input_ids.size(0)
         device = input_ids.device
 
@@ -523,18 +619,8 @@ class AccelInferenceEngine:
 
         reset_forward_context()
 
-        if self.lm_head is not None:
-            if last_hidden.dtype != next(self.lm_head.parameters()).dtype:
-                last_hidden = last_hidden.to(next(self.lm_head.parameters()).dtype)
-            logits = self.lm_head(last_hidden)  # [batch_size, vocab_size]
-        else:
-            logits = self.model.compute_logits(last_hidden)  # [batch_size, vocab_size]
-
-        temperatures = self._prepare_sample(sequences, temperature)
-        if temperature > 0:
-            first_token = self.sampler(logits, temperatures)
-        else:
-            first_token = torch.argmax(logits, dim=-1)
+        logits = self._compute_logits(last_hidden)
+        first_token = self._sample_tokens(logits, sequences)
 
         first_token_list = first_token.tolist()
 
@@ -576,21 +662,11 @@ class AccelInferenceEngine:
                 tts_text_pos_embedding=tts_text_pos_embedding,
             )
 
-            # Get logits
-            if self.lm_head is not None:
-                logits = self.lm_head(hidden_states)  # [batch_size, vocab_size]
-            else:
-                logits = self.model.compute_logits(
-                    hidden_states
-                )  # [batch_size, vocab_size]
+            logits = self._compute_logits(hidden_states)
 
             reset_forward_context()
 
-            temperatures = self._prepare_sample(sequences, temperature)
-            if temperature > 0:
-                next_token = self.sampler(logits, temperatures)
-            else:
-                next_token = torch.argmax(logits, dim=-1)
+            next_token = self._sample_tokens(logits, sequences)
             next_token_list = next_token.tolist()
 
             for i, token_id in enumerate(next_token_list):

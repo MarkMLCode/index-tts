@@ -419,7 +419,9 @@ class UnifiedVoice(nn.Module):
         self.use_accel = use_accel
         self.accel_engine = None  # Will be initialized in post_init_gpt2_config
 
-    def post_init_gpt2_config(self, use_deepspeed=False, kv_cache=False, half=False):
+    def post_init_gpt2_config(
+        self, use_deepspeed=False, kv_cache=False, half=False, accel_dtype=None
+    ):
         seq_length = self.max_mel_tokens + self.max_text_tokens + 2
         gpt_config = GPT2Config(
             vocab_size=self.number_mel_codes,
@@ -445,10 +447,9 @@ class UnifiedVoice(nn.Module):
             accel_gpt = GPT2AccelModel(gpt_config)
             accel_gpt.load_state_dict(self.gpt.state_dict(), strict=False)
 
-            if half:
-                accel_gpt = accel_gpt.half().cuda()
-            else:
-                accel_gpt = accel_gpt.cuda()
+            if accel_dtype is None and half:
+                accel_dtype = torch.float16
+            accel_gpt = accel_gpt.to(device="cuda", dtype=accel_dtype)
             accel_gpt.eval()
 
             lm_head_with_norm = nn.Sequential(self.final_norm, self.mel_head)
@@ -806,6 +807,10 @@ class UnifiedVoice(nn.Module):
                 max_new_tokens=max_length - trunc_index,
                 attention_mask=attention_mask,
                 temperature=hf_generate_kwargs.get('temperature', 1),
+                top_k=hf_generate_kwargs.get('top_k', 0),
+                top_p=hf_generate_kwargs.get('top_p', 1.0),
+                repetition_penalty=hf_generate_kwargs.get('repetition_penalty', 1.0),
+                do_sample=hf_generate_kwargs.get('do_sample', True),
                 stop_tokens=[self.stop_mel_token],
                 tts_embeddings=inputs_embeds,  # [pad][cond][text] embeddings (87 tokens, NO start_mel_token)
                 tts_mel_embedding=self.inference_model.embeddings,  # mel_embedding layer

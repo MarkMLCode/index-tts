@@ -312,15 +312,7 @@ def _canonical_gpt_state(state):
 def _clear_accel_prefix_cache(engine):
     if engine is None:
         return
-    if engine.current_sequences:
-        raise RuntimeError("cannot switch models while accelerated generation is active")
-    manager = engine.kv_manager
-    manager.block_hash_to_id.clear()
-    manager.used_block_ids.clear()
-    manager.free_block_ids.clear()
-    manager.free_block_ids.extend(range(manager.num_blocks))
-    for block in manager.blocks:
-        block.reset()
+    engine.reset_model_state()
 
 
 def load_gpt_checkpoint(checkpoint_path):
