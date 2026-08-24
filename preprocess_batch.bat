@@ -3,7 +3,7 @@ setlocal
 
 uv run python tools/preprocess_multiproc.py ^
     --manifest "%INDEXTTS_FINETUNE_MANIFEST%" ^
-    --output-dir "%INDEXTTS_FINETUNE_DATASET%_processed_data" ^
+    --output-dir "_processed_data\%INDEXTTS_FINETUNE_DATASET%" ^
     --model-dir checkpoints ^
     --config checkpoints/config.yaml ^
     --gpt-checkpoint checkpoints/gpt.pth ^

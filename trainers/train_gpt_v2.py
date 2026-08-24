@@ -35,6 +35,18 @@ from indextts.utils.tokenizer import LANGUAGE_DICT, TO_LANGUAGE_CODE, lang_to_to
 
 LANGUAGE_ALIASES = {"cn": "zh", "zhen": "zh", "jp": "ja"}
 
+# These modules define the pretrained coordinate system shared by CAMPPlus
+# speaker embeddings and the 1280-dimensional emotion embeddings.  Fine-tuning
+# them on a small, single-speaker dataset can make the GPT insensitive to the
+# emotion vectors used by the inference sliders.
+CONDITIONING_INTERFACE_MODULES = (
+    "spk_emb_proj",
+    "emo_conditioning_encoder",
+    "emo_perceiver_encoder",
+    "emovec_layer",
+    "emo_layer",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -74,6 +86,29 @@ def canonical_language(value: str | None) -> str:
     lang = LANGUAGE_ALIASES.get(lang, lang)
     lang = TO_LANGUAGE_CODE.get(lang, lang)
     return lang if lang in LANGUAGE_DICT else "common"
+
+
+def target_emotion_path(record: dict[str, Any]) -> str | None:
+    """Return emotion supervision aligned with the acoustic target.
+
+    Paired examples deliberately use another utterance for speaker identity.
+    Its emotion can differ from the target performance and must therefore only
+    be used as a compatibility fallback for older pair manifests.
+    """
+    return record.get("target_emo_vec_path") or record.get("prompt_emo_vec_path")
+
+
+def freeze_conditioning_interface(model: nn.Module) -> list[str]:
+    """Preserve the pretrained speaker/emotion embedding coordinate system."""
+    frozen: list[str] = []
+    for module_name in CONDITIONING_INTERFACE_MODULES:
+        module = getattr(model, module_name, None)
+        if module is None:
+            continue
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+        frozen.append(module_name)
+    return frozen
 
 
 @dataclass(frozen=True)
@@ -133,7 +168,7 @@ class GPTPairDataset(Dataset):
                         f"{spec.path}:{line_number} contains non-2.5 features; rerun preprocessing"
                     )
                 language = canonical_language(record.get("target_language") or spec.language)
-                emotion = record.get("prompt_emo_vec_path") or record.get("target_emo_vec_path")
+                emotion = target_emotion_path(record)
                 if not emotion:
                     raise ValueError(f"{spec.path}:{line_number} is missing an emotion vector")
                 self.samples.append(
@@ -360,6 +395,8 @@ def main() -> None:
     run_name = os.environ.get("INDEXTTS_RUN_NAME") or datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
     writer = SummaryWriter(log_dir=str(output_dir / "logs" / run_name))
     model, cfg = build_model(args.config.expanduser().resolve(), args.base_checkpoint.expanduser().resolve(), device)
+    frozen_conditioning = freeze_conditioning_interface(model)
+    print(f"[Train] frozen conditioning interface: {', '.join(frozen_conditioning)}")
     train_data = GPTPairDataset(parse_manifest_specs(args.train_manifests))
     val_data = GPTPairDataset(parse_manifest_specs(args.val_manifests))
     pin_memory = device.type == "cuda"
@@ -382,7 +419,7 @@ def main() -> None:
     metadata = {
         "model_version": "2.5", "config": str(args.config), "base_checkpoint": str(args.base_checkpoint),
         "train_manifests": train_data.manifest_summaries, "val_manifests": val_data.manifest_summaries,
-        "amp_dtype": str(amp_dtype),
+        "amp_dtype": str(amp_dtype), "frozen_conditioning_interface": frozen_conditioning,
     }
 
     epoch_start = global_step = 0

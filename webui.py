@@ -1,9 +1,11 @@
 import html
 import json
 import os
+import random
 import sys
 import threading
 import time
+from pathlib import Path
 
 import warnings
 
@@ -11,6 +13,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import pandas as pd
+import numpy as np
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
@@ -161,6 +164,239 @@ def build_tts(use_accel=False, use_torch_compile=False):
 
 
 tts = build_tts(use_accel=cmd_args.accel, use_torch_compile=cmd_args.torch_compile)
+MODEL_LOCK = threading.RLock()
+CURRENT_GPT_PATH = str(Path(tts.gpt_path).resolve())
+WEBUI_SETTINGS_PATH = Path(current_dir) / ".webui_settings.json"
+GPT_CHECKPOINT_EXCLUDED_NAMES = (
+    "s2mel",
+    "campplus",
+    "bigvgan",
+    "wav2vec",
+    "codec",
+    "emo_matrix",
+    "qwen",
+    "cfm",
+)
+
+
+def _portable_model_path(path):
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(Path(current_dir).resolve()).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def _save_last_gpt_checkpoint(path):
+    data = {"last_gpt_checkpoint": _portable_model_path(path)}
+    temporary = WEBUI_SETTINGS_PATH.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, WEBUI_SETTINGS_PATH)
+    except OSError as exc:
+        print(f">> Could not save {WEBUI_SETTINGS_PATH.name}: {exc}", file=sys.stderr)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _read_last_gpt_checkpoint():
+    if not WEBUI_SETTINGS_PATH.is_file():
+        return None
+    try:
+        data = json.loads(WEBUI_SETTINGS_PATH.read_text(encoding="utf-8"))
+        value = data.get("last_gpt_checkpoint")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = Path(current_dir) / path
+        return str(path.resolve())
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f">> Could not read {WEBUI_SETTINGS_PATH.name}: {exc}", file=sys.stderr)
+        return None
+
+
+def _is_gpt_checkpoint(path):
+    name = path.name.lower()
+    return (
+        path.is_file()
+        and path.suffix.lower() == ".pth"
+        and not any(part in name for part in GPT_CHECKPOINT_EXCLUDED_NAMES)
+    )
+
+
+def discover_gpt_checkpoints():
+    """Find base, pruned, and training GPT checkpoints available to the WebUI."""
+    roots = [
+        (Path(cmd_args.model_dir), False),
+        (Path(current_dir) / "models", True),
+        (Path(current_dir) / "_trained", True),
+    ]
+    paths = set()
+    for root, recursive in roots:
+        if not root.is_dir():
+            continue
+        candidates = root.rglob("*.pth") if recursive else root.glob("*.pth")
+        for path in candidates:
+            if _is_gpt_checkpoint(path):
+                paths.add(str(path.resolve()))
+    if Path(CURRENT_GPT_PATH).is_file():
+        paths.add(CURRENT_GPT_PATH)
+    return sorted(paths, key=lambda value: (value != CURRENT_GPT_PATH, value.lower()))
+
+
+def _model_label(path):
+    try:
+        return Path(path).resolve().relative_to(Path(current_dir).resolve()).as_posix()
+    except ValueError:
+        return str(Path(path).resolve())
+
+
+def format_model_choices(paths):
+    labels = []
+    mapping = {}
+    selected = None
+    for path in paths:
+        base_label = _model_label(path)
+        label = base_label
+        counter = 2
+        while label in mapping:
+            label = f"{base_label} ({counter})"
+            counter += 1
+        labels.append(label)
+        mapping[label] = path
+        if os.path.normcase(path) == os.path.normcase(CURRENT_GPT_PATH):
+            selected = label
+    if selected is None and labels:
+        selected = labels[0]
+    return labels, mapping, selected
+
+
+def model_status_text():
+    label = _model_label(CURRENT_GPT_PATH)
+    suffix = " Dynamic switching is unavailable with DeepSpeed." if cmd_args.deepspeed else ""
+    return f"✅ Loaded GPT model: `{label}`.{suffix}"
+
+
+def _read_checkpoint_state(checkpoint_path):
+    import torch
+
+    try:
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except TypeError:  # Older PyTorch versions do not expose weights_only.
+        payload = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(payload, dict) and isinstance(payload.get("model"), dict):
+        payload = payload["model"]
+    if not isinstance(payload, dict):
+        raise ValueError("checkpoint does not contain a model state dictionary")
+    state = {}
+    for key, value in payload.items():
+        normalized = key.removeprefix("module.")
+        if hasattr(value, "shape"):
+            state[normalized] = value
+    return state
+
+
+def _canonical_gpt_state(state):
+    return {
+        key: value
+        for key, value in state.items()
+        if not key.startswith(("inference_model.", "ds_engine."))
+        and "accel_engine" not in key
+        and key != "gpt.wte.weight"
+    }
+
+
+def _clear_accel_prefix_cache(engine):
+    if engine is None:
+        return
+    if engine.current_sequences:
+        raise RuntimeError("cannot switch models while accelerated generation is active")
+    manager = engine.kv_manager
+    manager.block_hash_to_id.clear()
+    manager.used_block_ids.clear()
+    manager.free_block_ids.clear()
+    manager.free_block_ids.extend(range(manager.num_blocks))
+    for block in manager.blocks:
+        block.reset()
+
+
+def load_gpt_checkpoint(checkpoint_path):
+    """Replace only GPT weights, retaining the shared 2.5 inference components."""
+    global CURRENT_GPT_PATH
+    if cmd_args.deepspeed:
+        raise RuntimeError(
+            "Live model switching is not supported with --deepspeed. "
+            "Restart the WebUI with the desired checkpoint or without DeepSpeed."
+        )
+
+    resolved = str(Path(checkpoint_path).expanduser().resolve())
+    if not Path(resolved).is_file():
+        raise FileNotFoundError(f"GPT checkpoint not found: {resolved}")
+    if os.path.normcase(resolved) == os.path.normcase(CURRENT_GPT_PATH):
+        _save_last_gpt_checkpoint(resolved)
+        return
+
+    state = _read_checkpoint_state(resolved)
+    with MODEL_LOCK:
+        expected = tts.gpt.state_dict()
+        required = _canonical_gpt_state(expected)
+        candidate = _canonical_gpt_state(state)
+        matched = {key: value for key, value in candidate.items() if key in required}
+        shape_errors = [
+            f"{key}: expected {tuple(required[key].shape)}, got {tuple(value.shape)}"
+            for key, value in matched.items()
+            if tuple(value.shape) != tuple(required[key].shape)
+        ]
+        if shape_errors:
+            preview = "; ".join(shape_errors[:5])
+            raise ValueError(f"checkpoint tensor shapes are incompatible: {preview}")
+
+        matched = {
+            key: value
+            for key, value in matched.items()
+            if tuple(value.shape) == tuple(required[key].shape)
+        }
+        coverage = len(matched) / max(len(required), 1)
+        if len(matched) != len(required):
+            missing = sorted(set(required) - set(matched))
+            raise ValueError(
+                f"checkpoint only matches {coverage:.1%} of this IndexTTS-{cmd_args.version} "
+                f"GPT ({len(matched)}/{len(required)} tensors); missing examples: {missing[:5]}"
+            )
+
+        tts.gpt.load_state_dict(matched, strict=False)
+        tts.gpt.eval()
+        if tts.gpt.accel_engine is not None:
+            # The stock acceleration setup intentionally uses strict=False because its
+            # attention implementation has a slightly different state schema.
+            tts.gpt.accel_engine.model.load_state_dict(
+                tts.gpt.gpt.state_dict(), strict=False
+            )
+            _clear_accel_prefix_cache(tts.gpt.accel_engine)
+        tts.gpt_path = resolved
+        CURRENT_GPT_PATH = resolved
+        _save_last_gpt_checkpoint(resolved)
+
+
+def restore_last_gpt_checkpoint():
+    saved = _read_last_gpt_checkpoint()
+    if not saved or os.path.normcase(saved) == os.path.normcase(CURRENT_GPT_PATH):
+        return
+    if not Path(saved).is_file():
+        print(f">> Saved GPT checkpoint is no longer available: {saved}", file=sys.stderr)
+        return
+    try:
+        load_gpt_checkpoint(saved)
+        print(f">> Restored last WebUI GPT model: {saved}")
+    except Exception as exc:
+        print(f">> Could not restore saved GPT checkpoint {saved}: {exc}", file=sys.stderr)
+
+
+restore_last_gpt_checkpoint()
+
 # 支持的语言列表
 LANGUAGES = {
     "中文": "zh_CN",
@@ -251,6 +487,7 @@ def _build_preset_data(
     repetition_penalty,
     max_mel_tokens,
     max_text_tokens_per_segment,
+    seed_value,
 ):
     """Collect all non-audio UI values into a dictionary for preset storage."""
     return {
@@ -273,6 +510,7 @@ def _build_preset_data(
             "max_mel_tokens": int(max_mel_tokens) if max_mel_tokens is not None else 1500,
             "max_text_tokens_per_segment": int(max_text_tokens_per_segment)
             if max_text_tokens_per_segment is not None else 120,
+            "seed": int(seed_value) if seed_value is not None else -1,
         },
     }
 
@@ -295,6 +533,7 @@ def on_preset_save(
     repetition_penalty,
     max_mel_tokens,
     max_text_tokens_per_segment,
+    seed_value,
 ):
     """Save the current UI state as a named preset."""
     name = name.strip() if name else ""
@@ -308,7 +547,7 @@ def on_preset_save(
         emo_text, emo_random,
         do_sample, top_p, top_k, temperature,
         length_penalty, num_beams, repetition_penalty,
-        max_mel_tokens, max_text_tokens_per_segment,
+        max_mel_tokens, max_text_tokens_per_segment, seed_value,
     )
 
     existed = name in list_presets()
@@ -402,6 +641,7 @@ def on_preset_load(name):
             max_text_tokens_per_segment: gr.update(
                 value=advanced.get("max_text_tokens_per_segment", 120)
             ),
+            seed_value: gr.update(value=advanced.get("seed", -1)),
         }
     except Exception as e:
         gr.Error(f"{i18n('加载预设失败')}: {e}")
@@ -510,6 +750,7 @@ def _format_preset_preview(
     repetition_penalty,
     max_mel_tokens,
     max_text_tokens_per_segment,
+    seed_value,
 ):
     """Format the current UI state as a Markdown preview for the save modal."""
     emo_label = EMO_CHOICES_ALL[emo_control_method] if 0 <= emo_control_method < len(EMO_CHOICES_ALL) else i18n("未知")
@@ -537,6 +778,7 @@ def _format_preset_preview(
         f"- repetition_penalty: {repetition_penalty}",
         f"- max_mel_tokens: {max_mel_tokens}",
         f"- max_text_tokens_per_segment: {max_text_tokens_per_segment}",
+        f"- seed: {seed_value}",
     ]
     return "\n".join(lines)
 
@@ -558,6 +800,7 @@ def open_save_preset_modal(
     repetition_penalty,
     max_mel_tokens,
     max_text_tokens_per_segment,
+    seed_value,
 ):
     """Open the save-preset modal and populate the preview."""
     preview = _format_preset_preview(
@@ -566,7 +809,7 @@ def open_save_preset_modal(
         emo_text, emo_random,
         do_sample, top_p, top_k, temperature,
         length_penalty, num_beams, repetition_penalty,
-        max_mel_tokens, max_text_tokens_per_segment,
+        max_mel_tokens, max_text_tokens_per_segment, seed_value,
     )
     return (
         gr.update(visible=True),
@@ -593,6 +836,7 @@ def confirm_save_preset_from_modal(
     repetition_penalty,
     max_mel_tokens,
     max_text_tokens_per_segment,
+    seed_value,
 ):
     """Save the preset and close the modal."""
     result = on_preset_save(
@@ -613,6 +857,7 @@ def confirm_save_preset_from_modal(
         repetition_penalty,
         max_mel_tokens,
         max_text_tokens_per_segment,
+        seed_value,
     )
     return (
         gr.update(visible=False),  # modal
@@ -626,6 +871,48 @@ def close_save_preset_modal():
     return gr.update(visible=False)
 
 
+def _normalize_seed(seed_value):
+    if seed_value is None or str(seed_value).strip() == "":
+        seed_value = -1
+    try:
+        seed = int(float(seed_value))
+    except (TypeError, ValueError):
+        raise ValueError("Seed must be an integer or -1 for a random result.") from None
+    if seed < 0:
+        return random.SystemRandom().randrange(0, 2**63 - 1)
+    return seed
+
+
+def _apply_seed(seed):
+    import torch
+
+    random.seed(seed % (2**32))
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed % (2**63 - 1))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed % (2**63 - 1))
+
+
+def _format_stream_chunk(chunk, sampling_rate=22050):
+    if chunk is None:
+        return None
+    if hasattr(chunk, "detach"):
+        audio = chunk.detach().cpu().numpy()
+    else:
+        audio = np.asarray(chunk)
+    if audio.size == 0:
+        return None
+    audio = np.squeeze(audio)
+    if audio.ndim != 1:
+        audio = audio.reshape(-1)
+    peak = float(np.max(np.abs(audio)))
+    if peak > 1.5:
+        audio = np.clip(audio, -32767, 32767).astype(np.int16)
+    else:
+        audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
+    return sampling_rate, audio
+
+
 def gen_single(emo_control_method,prompt, text,
                lang_choice,
                emo_ref_path, emo_weight,
@@ -633,6 +920,8 @@ def gen_single(emo_control_method,prompt, text,
                emo_text,emo_random,
                max_text_tokens_per_segment=120,
                duration_factor=1.0,
+               seed_value=-1,
+               streaming_enabled=False,
                 *args, progress=gr.Progress()):
     output_path = None
     if not output_path:
@@ -685,8 +974,29 @@ def gen_single(emo_control_method,prompt, text,
     )
     if IS_V25:
         infer_kwargs["lang"] = lang_choice or "ZH"
-    output = tts.infer(**infer_kwargs)
-    return gr.update(value=output,visible=True)
+    seed = _normalize_seed(seed_value)
+    print(f">> generation seed: {seed}")
+
+    # Gradio closes every streaming output when this generator finishes. Initialize
+    # the stream even when live playback is disabled so that close is well-defined.
+    yield None, gr.update(value=None, visible=True)
+
+    if streaming_enabled:
+        infer_kwargs["stream_return"] = True
+        with MODEL_LOCK:
+            _apply_seed(seed)
+            chunks = tts.infer(**infer_kwargs)
+            for chunk in chunks:
+                formatted = _format_stream_chunk(chunk)
+                if formatted is not None:
+                    yield formatted, gr.skip()
+        yield gr.skip(), gr.update(value=output_path, visible=True)
+        return
+
+    with MODEL_LOCK:
+        _apply_seed(seed)
+        output = tts.infer(**infer_kwargs)
+    yield gr.skip(), gr.update(value=output, visible=True)
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
@@ -746,7 +1056,6 @@ with gr.Blocks(
         }
     """,
 ) as demo:
-    mutex = threading.Lock()
     arxiv_id = "2601.03888" if IS_V25 else "2506.21619"
     gr.HTML(f'''
        <h2 style="text-align:center">IndexTTS-{cmd_args.version}</h2>
@@ -754,6 +1063,67 @@ with gr.Blocks(
    <a href='https://arxiv.org/abs/{arxiv_id}'><img src='https://img.shields.io/badge/ArXiv-{arxiv_id}-red'></a>
    </p>
        ''')
+
+    model_paths = discover_gpt_checkpoints()
+    model_labels, model_map, selected_model_label = format_model_choices(model_paths)
+    model_map_state = gr.State(model_map)
+    with gr.Accordion("GPT Model", open=False):
+        model_status = gr.Markdown(value=model_status_text())
+        with gr.Row():
+            model_dropdown = gr.Dropdown(
+                choices=model_labels,
+                value=selected_model_label,
+                label="GPT checkpoint (.pth)",
+                info="Scans checkpoints, models, and _trained. Only one GPT model is active at a time.",
+                interactive=not cmd_args.deepspeed,
+                scale=4,
+            )
+            refresh_models_button = gr.Button("Refresh", variant="secondary", scale=1)
+            load_model_button = gr.Button(
+                "Load Model", variant="primary", interactive=not cmd_args.deepspeed, scale=1
+            )
+
+    def refresh_model_list():
+        paths = discover_gpt_checkpoints()
+        labels, mapping, selected = format_model_choices(paths)
+        return (
+            gr.update(choices=labels, value=selected),
+            mapping,
+            model_status_text(),
+        )
+
+    def handle_model_load(
+        selected_label,
+        mapping,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        path = (mapping or {}).get(selected_label or "")
+        if not path:
+            gr.Warning("Select a GPT checkpoint before loading.")
+            return model_status_text()
+        progress(0.1, desc="Validating GPT checkpoint")
+        try:
+            load_gpt_checkpoint(path)
+        except Exception as exc:
+            print(f">> Failed to load GPT checkpoint: {exc}", file=sys.stderr)
+            gr.Warning(f"Failed to load GPT checkpoint: {exc}")
+            return f"❌ Failed to load `{_model_label(path)}`: {exc}"
+        progress(1.0, desc="GPT model loaded")
+        gr.Info(f"Loaded GPT model: {_model_label(path)}")
+        return model_status_text()
+
+    refresh_models_button.click(
+        refresh_model_list,
+        inputs=[],
+        outputs=[model_dropdown, model_map_state, model_status],
+    )
+    load_model_button.click(
+        handle_model_load,
+        inputs=[model_dropdown, model_map_state],
+        outputs=[model_status],
+        concurrency_limit=1,
+        concurrency_id="model-runtime",
+    )
 
     with gr.Tab(i18n("音频生成")):
         os.makedirs("prompts", exist_ok=True)
@@ -810,11 +1180,27 @@ with gr.Blocks(
                     key="duration_factor",
                 )
             with gr.Column(scale=1):
+                streaming_enabled = gr.Checkbox(
+                    label="Realtime streaming playback",
+                    value=False,
+                    info="Play each generated segment immediately. Smaller segment-token limits reduce latency.",
+                )
                 gen_button = gr.Button(
                     i18n("生成语音"), key="gen_button", interactive=True
                 )
+                stream_audio = gr.Audio(
+                    label="Live playback",
+                    streaming=True,
+                    autoplay=True,
+                    visible=False,
+                    format="wav",
+                    show_download_button=False,
+                    key="stream_audio",
+                )
                 output_audio = gr.Audio(
-                    label=i18n("生成结果"), visible=True, key="output_audio"
+                    label=f"{i18n('生成结果')} (complete WAV)",
+                    visible=True,
+                    key="output_audio",
                 )
 
         with gr.Row():
@@ -907,6 +1293,13 @@ with gr.Blocks(
                     with gr.Row():
                         repetition_penalty = gr.Number(label="repetition_penalty", precision=None, value=10.0, minimum=0.1, maximum=20.0, step=0.1)
                         length_penalty = gr.Number(label="length_penalty", precision=None, value=0.0, minimum=-2.0, maximum=2.0, step=0.1)
+                        seed_value = gr.Number(
+                            label="seed",
+                            precision=0,
+                            value=-1,
+                            minimum=-1,
+                            info="Use -1 for a random result; reuse any non-negative seed for reproducibility.",
+                        )
                     max_mel_tokens = gr.Slider(label="max_mel_tokens", value=1500, minimum=50, maximum=tts.cfg.gpt.max_mel_tokens, step=10, info=i18n("生成Token最大数量，过小导致音频被截断"), key="max_mel_tokens")
                     # with gr.Row():
                     #     typical_sampling = gr.Checkbox(label="typical_sampling", value=False, info="不建议使用")
@@ -1268,6 +1661,7 @@ with gr.Blocks(
         repetition_penalty,
         max_mel_tokens,
         max_text_tokens_per_segment,
+        seed_value,
     ]
     _preset_save_inputs = [
         prompt_audio,
@@ -1286,6 +1680,7 @@ with gr.Blocks(
         repetition_penalty,
         max_mel_tokens,
         max_text_tokens_per_segment,
+        seed_value,
     ]
 
     # Audio generation tab: load from preset on dropdown change
@@ -1358,6 +1753,12 @@ with gr.Blocks(
         outputs=[load_preset_dropdown, manage_preset_dropdown],
     )
 
+    streaming_enabled.change(
+        lambda enabled: gr.update(visible=bool(enabled)),
+        inputs=[streaming_enabled],
+        outputs=[stream_audio],
+    )
+
     gen_button.click(gen_single,
                      inputs=[emo_control_method,prompt_audio, input_text_single,
                             lang_dropdown,
@@ -1366,9 +1767,14 @@ with gr.Blocks(
                              emo_text,emo_random,
                              max_text_tokens_per_segment,
                              duration_factor,
+                             seed_value,
+                             streaming_enabled,
                              *advanced_params,
                      ],
-                     outputs=[output_audio])
+                     outputs=[stream_audio, output_audio],
+                     concurrency_limit=1,
+                     concurrency_id="model-runtime",
+                     stream_every=0.1)
 
 
 

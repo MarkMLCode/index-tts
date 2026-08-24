@@ -186,6 +186,13 @@ uv run webui.py --version 2 --model_dir ./checkpoints_2
 
 Open your browser and visit `http://127.0.0.1:7860` to see the demo.
 
+The WebUI can refresh and switch among GPT checkpoints in `checkpoints`,
+`models`, and `_trained` without reloading the shared audio models. It remembers
+the last successfully loaded checkpoint in the ignored local file
+`.webui_settings.json`. Advanced generation controls include a reproducible
+seed (`-1` chooses a fresh random seed), and **Realtime streaming playback**
+plays each completed segment while the full WAV continues generating.
+
 You can adjust the settings to enable BF16 (IndexTTS-2.5) / FP16 (IndexTTS-2)
 inference (lower VRAM usage), DeepSpeed acceleration, compiled CUDA kernels for
 speed, etc. All available options can be seen via:

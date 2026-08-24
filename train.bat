@@ -2,11 +2,11 @@
 setlocal
 
 uv run python trainers/train_gpt_v2.py ^
-    --train-manifest "%INDEXTTS_FINETUNE_DATASET%_processed_data/gpt_pairs_train.jsonl" ^
-    --val-manifest "%INDEXTTS_FINETUNE_DATASET%_processed_data/gpt_pairs_val.jsonl" ^
+    --train-manifest "_processed_data\%INDEXTTS_FINETUNE_DATASET%\gpt_pairs_train.jsonl" ^
+    --val-manifest "_processed_data\%INDEXTTS_FINETUNE_DATASET%\gpt_pairs_val.jsonl" ^
     --config checkpoints/config.yaml ^
     --base-checkpoint checkpoints/gpt.pth ^
-    --output-dir "trained_ckpts_%INDEXTTS_FINETUNE_DATASET%" ^
+    --output-dir "_trained\%INDEXTTS_FINETUNE_DATASET%" ^
     --batch-size 2 ^
     --grad-accumulation 2 ^
     --epochs 20 ^

@@ -8,9 +8,9 @@ The script consumes an existing manifest (the one produced by
 describes a training sample formed by pairing two utterances from the same
 speaker:
 
-    - The *prompt* side contributes the speaker embedding and emotion vector.
-    - The *target* side contributes the text token ids and semantic codes the
-      GPT should predict.
+    - The *prompt* side contributes the speaker embedding.
+    - The *target* side contributes the emotion vector, text token ids, and
+      semantic codes the GPT should predict.
 
 This mirrors the pairing strategy described in the IndexTTS2 paper (different
 utterances per speaker for prompt vs target) while letting us reuse the cached
