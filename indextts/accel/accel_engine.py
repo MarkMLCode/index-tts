@@ -33,6 +33,9 @@ class Sampler(nn.Module):
 
 
 class AccelInferenceEngine:
+    # GPT2InferenceModel assigns the start-of-speech token mel position 0.
+    TTS_START_POSITION = 0
+
     def __init__(
         self,
         model,
@@ -169,7 +172,7 @@ class AccelInferenceEngine:
 
             pos = len(req) - 1
             if hasattr(self, "_tts_mode") and self._tts_mode:
-                pos = pos - (self._tts_prompt_len - 1)
+                pos = self._tts_decode_position(len(req))
             positions.append(pos)
 
             context_lens.append(len(req))
@@ -214,6 +217,16 @@ class AccelInferenceEngine:
         )
 
         return input_ids, positions
+
+    def _tts_decode_position(self, sequence_length: int) -> int:
+        """Match GPT2InferenceModel's generated mel-token positions.
+
+        The stock path uses position 0 for the start token and position 2 for
+        the first generated token. ``sequence_length`` already includes the
+        token about to be decoded, while ``_tts_prompt_len`` includes the
+        start token.
+        """
+        return sequence_length - self._tts_prompt_len + 1
 
     def _prepare_sample(self, requests: List[Seq], temperature: float):
         temperatures = [temperature] * len(requests)
@@ -569,8 +582,8 @@ class AccelInferenceEngine:
                 torch.tensor([[start_token_id]], device="cuda")
             )  # [1, 1, hidden_dim]
 
-            start_pos = torch.tensor(
-                [[tts_embeddings.size(1)]], device="cuda", dtype=torch.long
+            start_pos = torch.full_like(
+                start_token_id.reshape(1, 1), self.TTS_START_POSITION
             )
             pos_emb = tts_text_pos_embedding.emb(start_pos)
             start_emb = start_emb + pos_emb

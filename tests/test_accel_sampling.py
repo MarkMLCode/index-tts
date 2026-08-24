@@ -27,6 +27,14 @@ def sampling_engine() -> AccelInferenceEngine:
 
 
 class AccelSamplingParityTests(unittest.TestCase):
+    def test_tts_positions_match_standard_inference_model(self) -> None:
+        engine = sampling_engine()
+        engine._tts_prompt_len = 48
+
+        self.assertEqual(engine.TTS_START_POSITION, 0)
+        self.assertEqual(engine._tts_decode_position(49), 2)
+        self.assertEqual(engine._tts_decode_position(50), 3)
+
     def test_logits_processors_match_transformers_single_beam_pipeline(self) -> None:
         engine = sampling_engine()
         original = torch.tensor([[3.2, 1.1, -0.4, 2.7, 0.3, -1.2]])
