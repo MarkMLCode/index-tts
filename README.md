@@ -216,6 +216,38 @@ uv run webui.py -h
 
 For production deployment, see the [vLLM recipe for IndexTTS](https://recipes.vllm.ai/IndexTeam/IndexTTS-2.5).
 
+### 🌐 HTTP API
+
+`api.py` keeps one IndexTTS2.5 model in memory and serializes model loading and
+inference. Start it with:
+
+```bash
+uv run api.py --bind-addr 127.0.0.1 --port 9880
+```
+
+Load the checkpoint from `config.yaml` (or add a singular `gpt_checkpoint`
+path to load a fine-tuned GPT checkpoint):
+
+```bash
+curl -X POST http://127.0.0.1:9880/load_model \
+  -H "Content-Type: application/json" \
+  -d '{"model_dir":"checkpoints","config":"checkpoints/config.yaml","use_bf16":true}'
+```
+
+Generate audio from the loaded model:
+
+```bash
+curl -X POST http://127.0.0.1:9880/generate \
+  -H "Content-Type: application/json" \
+  -d '{"speaker":"examples/voice_01.wav","text":"Hello world","lang":"EN","media_type":"wav"}' \
+  --output gen.wav
+```
+
+The server also provides the GPT-SoVITS-compatible `GET /tts` endpoint and
+supports `wav`, `raw`, `ogg`, and `aac` responses. AAC output requires the
+`ffmpeg` executable. A later `/load_model` call releases the current model
+before loading its replacement; `/generate` never switches checkpoints.
+
 ### 📝 Python API
 
 To run scripts, use `uv run <file.py>` so the code runs inside the `uv`

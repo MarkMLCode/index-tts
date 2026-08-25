@@ -47,3 +47,6 @@ desktop.ini
 /.webui_settings.json
 /.webui_settings.tmp
 /voicelines/
+/_models/
+
+/indextts/s2mel/

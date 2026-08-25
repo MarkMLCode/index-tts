@@ -76,7 +76,8 @@ def apply_pronunciation_annotations(text: str) -> str:
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_bf16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False, use_qwen_emo=False
+            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False, use_qwen_emo=False,
+            gpt_checkpoint_path=None,
     ):
         """
         Args:
@@ -91,6 +92,8 @@ class IndexTTS2:
             use_qwen_emo (bool): if True, load the QwenEmotion text-to-emotion model.
                 Required for ``infer(..., use_emo_text=True)``. Attempting to use emotion-text
                 guidance when this is disabled will raise a RuntimeError.
+            gpt_checkpoint_path (str | None): optional GPT checkpoint override. When omitted,
+                the checkpoint named by ``config.yaml`` is loaded.
         """
         if device is not None:
             self.device = device
@@ -137,7 +140,12 @@ class IndexTTS2:
             print(">> QwenEmotion not loaded (use_qwen_emo=False)")
 
         self.gpt = UnifiedVoice(**self.cfg.gpt, use_accel=self.use_accel, spk_cond_mode="campplus")
-        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        if gpt_checkpoint_path is None:
+            self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        else:
+            self.gpt_path = os.path.abspath(os.path.expanduser(gpt_checkpoint_path))
+            if not os.path.isfile(self.gpt_path):
+                raise FileNotFoundError(f"GPT checkpoint not found: {self.gpt_path}")
         load_checkpoint(self.gpt, self.gpt_path)
         self.gpt = self.gpt.to(self.device)
         if self.use_bf16:

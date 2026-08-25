@@ -34,6 +34,7 @@ dependencies = [
   "descript-audiotools==0.7.2",
   "einops>=0.8.1",
   "ffmpeg-python==0.2.0",
+  "fastapi==0.116.2",
   "fugashi>=1.2.0",
   "unidic-lite>=1.0.0",
   "g2p-en==2.1.0",
@@ -66,6 +67,8 @@ dependencies = [
   "WeTextProcessing; sys_platform == 'linux'",
   "pytest>=9.0.3",
   "sounddevice>=0.5.6",
+  "soundfile==0.13.1",
+  "uvicorn==0.35.0",
 ]
 
 [project.optional-dependencies]
