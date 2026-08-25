@@ -193,16 +193,65 @@ class KVCacheManager:
         sequence.num_cached_tokens = 0
         sequence.block_table.clear()
 
+    def fork_sequence(self, sequence: Seq) -> Seq:
+        """Create a beam branch that shares the sequence's existing KV blocks.
+
+        Full prefix blocks can remain shared for the lifetime of both beams. A
+        partially filled final block is copied lazily by ``append_to_seq`` when
+        a branch first diverges.
+        """
+        if not sequence.block_table:
+            raise ValueError("cannot fork a sequence without allocated KV blocks")
+
+        child = Seq(sequence.token_ids, block_size=sequence.block_size)
+        child.num_prompt_tokens = sequence.num_prompt_tokens
+        child.num_cached_tokens = sequence.num_cached_tokens
+        child.block_table = copy(sequence.block_table)
+
+        for block_id in child.block_table:
+            self.blocks[block_id].ref_cnt += 1
+
+        return child
+
+    def _copy_on_write_last_block(self, sequence: Seq) -> None:
+        """Give a diverging beam an exclusive copy of its partial last block."""
+        old_block_id = sequence.block_table[-1]
+        old_block = self.blocks[old_block_id]
+        if old_block.ref_cnt <= 1:
+            return
+        if not self.free_block_ids:
+            raise RuntimeError("KV cache exhausted while forking beam sequence")
+
+        new_block_id = self.free_block_ids[0]
+        new_block = self._allocate_block(new_block_id)
+        self.kv_cache[:, :, new_block_id].copy_(
+            self.kv_cache[:, :, old_block_id]
+        )
+        new_block._block_hash = old_block.block_hash
+        new_block.token_ids = copy(old_block.token_ids)
+
+        old_block.ref_cnt -= 1
+        sequence.block_table[-1] = new_block_id
+
     def append_to_seq(self, sequence: Seq):
         block_table = sequence.block_table
         last_block = self.blocks[block_table[-1]]
 
         if len(sequence) % self.block_size == 1:
             assert last_block.block_hash is not None
+            if not self.free_block_ids:
+                raise RuntimeError("KV cache exhausted while extending sequence")
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
-        elif len(sequence) % self.block_size == 0:
+        else:
+            # The newly appended token belongs to the existing final block.
+            # Beam siblings may share that partial block, so fork it before the
+            # next decode writes the new token's K/V values into the cache.
+            self._copy_on_write_last_block(sequence)
+            last_block = self.blocks[block_table[-1]]
+
+        if len(sequence) % self.block_size == 0:
             assert last_block.block_hash is None
             token_ids = sequence.get_block_tokens(sequence.num_blocks - 1)
             parent_hash = (
@@ -213,7 +262,7 @@ class KVCacheManager:
             block_hash = self.compute_block_hash(token_ids, parent_hash)
             last_block.update(block_hash, token_ids)
             self.block_hash_to_id[block_hash] = last_block.block_id
-        else:
+        elif len(sequence) % self.block_size != 1:
             assert last_block.block_hash is None
 
     def remove_seq(self, sequence: Seq):

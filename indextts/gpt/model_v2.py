@@ -811,6 +811,8 @@ class UnifiedVoice(nn.Module):
                 top_p=hf_generate_kwargs.get('top_p', 1.0),
                 repetition_penalty=hf_generate_kwargs.get('repetition_penalty', 1.0),
                 do_sample=hf_generate_kwargs.get('do_sample', True),
+                num_beams=hf_generate_kwargs.get('num_beams', 1),
+                length_penalty=hf_generate_kwargs.get('length_penalty', 1.0),
                 stop_tokens=[self.stop_mel_token],
                 tts_embeddings=inputs_embeds,  # [pad][cond][text] embeddings (87 tokens, NO start_mel_token)
                 tts_mel_embedding=self.inference_model.embeddings,  # mel_embedding layer

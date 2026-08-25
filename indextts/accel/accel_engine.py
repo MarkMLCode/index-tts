@@ -14,24 +14,6 @@ from .attention import (
 from .kv_manager import KVCacheManager, Seq
 
 
-class Sampler(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    @torch.compile
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
-        temperatures = temperatures.to(logits.device).clamp(min=1e-8)
-        greedy_mask = temperatures < 1e-5
-        temp_for_scaling = torch.where(greedy_mask, 1.0, temperatures)
-        scaled_logits = logits / temp_for_scaling.unsqueeze(-1)
-        probs = torch.softmax(scaled_logits, dim=-1, dtype=torch.float32)
-        q = torch.empty_like(probs)
-        q.exponential_()
-        sampled_tokens = probs.div_(q).argmax(dim=-1)
-        greedy_tokens = logits.argmax(dim=-1)
-        return torch.where(greedy_mask, greedy_tokens, sampled_tokens)
-
-
 class AccelInferenceEngine:
     # GPT2InferenceModel assigns the start-of-speech token mel position 0.
     TTS_START_POSITION = 0
@@ -77,7 +59,6 @@ class AccelInferenceEngine:
             dtype=next(model.parameters()).dtype,
         )
         self.kv_manager.wire_kv_cache_to_model(model)
-        self.sampler = Sampler()
         # Sampling is sensitive to logit rounding. Lazily retain an fp32 copy
         # of the final norm/head when accelerated inference runs in fp16/bf16.
         self._lm_head_fp32: Optional[nn.Module] = None
@@ -267,7 +248,9 @@ class AccelInferenceEngine:
             row.scatter_(0, token_ids, scores)
         return logits
 
-    def _warp_logits(self, logits: torch.Tensor) -> torch.Tensor:
+    def _warp_logits(
+        self, logits: torch.Tensor, min_tokens_to_keep: int = 1
+    ) -> torch.Tensor:
         """Apply temperature, top-k, and top-p in transformers order."""
         temperature = self._gen_temperature
         top_k = self._gen_top_k
@@ -277,7 +260,7 @@ class AccelInferenceEngine:
             logits = logits / temperature
 
         if top_k is not None and top_k > 0:
-            keep = min(int(top_k), logits.size(-1))
+            keep = min(max(int(top_k), min_tokens_to_keep), logits.size(-1))
             threshold = torch.topk(logits, keep, dim=-1)[0][..., -1, None]
             logits = logits.masked_fill(logits < threshold, float("-inf"))
 
@@ -287,7 +270,7 @@ class AccelInferenceEngine:
             )
             cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
             sorted_remove = cumulative_probs <= (1.0 - top_p)
-            sorted_remove[..., -1:] = False
+            sorted_remove[..., -min_tokens_to_keep:] = False
             remove = sorted_remove.scatter(1, sorted_indices, sorted_remove)
             logits = logits.masked_fill(remove, float("-inf"))
 
@@ -302,8 +285,224 @@ class AccelInferenceEngine:
             return logits.argmax(dim=-1)
         logits = self._warp_logits(logits)
         probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
-        noise = torch.empty_like(probabilities).exponential_(1.0)
-        return probabilities.div_(noise).argmax(dim=-1)
+        # Match Transformers' single-beam sampling path. Although the previous
+        # exponential-race sampler represented the same categorical
+        # distribution, it consumed random numbers differently and therefore
+        # selected different tokens for the same seed, making direct parity
+        # comparisons unnecessarily difficult.
+        return torch.multinomial(probabilities, num_samples=1).squeeze(1)
+
+    def _beam_candidates(
+        self,
+        logits: torch.Tensor,
+        sequences: List[Seq],
+        beam_scores: torch.Tensor,
+        num_beams: int,
+    ) -> List[tuple[float, int, int]]:
+        """Return ranked ``(score, parent beam, token)`` candidates."""
+        # Transformers' beam loop converts logits to log probabilities before
+        # applying its LogitsProcessorList. This differs from its single-beam
+        # sampling loop and matters substantially for large repetition
+        # penalties because log-softmax scores are non-positive.
+        processed = torch.log_softmax(logits.float(), dim=-1)
+        processed = self._apply_repetition_penalty(processed, sequences)
+        if self._gen_do_sample:
+            # Transformers keeps at least two tokens for beam sampling so one
+            # low-ranked token cannot collapse all beam diversity.
+            processed = self._warp_logits(processed, min_tokens_to_keep=2)
+
+        token_scores = processed + beam_scores[:, None]
+        flat_scores = token_scores.reshape(-1)
+        candidate_count = min(2 * num_beams, flat_scores.numel())
+
+        if self._gen_do_sample:
+            probabilities = torch.softmax(flat_scores, dim=0)
+            support = int((probabilities > 0).sum().item())
+            candidate_count = min(candidate_count, support)
+            if candidate_count == 0:
+                raise RuntimeError("beam sampling has no finite token candidates")
+            candidate_indices = torch.multinomial(
+                probabilities, num_samples=candidate_count, replacement=False
+            )
+            candidate_scores = flat_scores[candidate_indices]
+            order = torch.argsort(candidate_scores, descending=True)
+            candidate_indices = candidate_indices[order]
+            candidate_scores = candidate_scores[order]
+        else:
+            candidate_scores, candidate_indices = torch.topk(
+                flat_scores, k=candidate_count, largest=True, sorted=True
+            )
+
+        vocab_size = logits.size(-1)
+        parent_indices = torch.div(
+            candidate_indices, vocab_size, rounding_mode="floor"
+        )
+        token_ids = candidate_indices.remainder(vocab_size)
+        return list(
+            zip(
+                candidate_scores.tolist(),
+                parent_indices.tolist(),
+                token_ids.tolist(),
+            )
+        )
+
+    @staticmethod
+    def _normalized_beam_score(
+        score: float, generated_length: int, length_penalty: float
+    ) -> float:
+        length = max(1, generated_length)
+        return score / (length ** length_penalty)
+
+    def _branch_beam_sequences(
+        self,
+        parents: List[Seq],
+        candidates: List[tuple[float, int, int]],
+    ) -> tuple[List[Seq], List[float]]:
+        """Fork only parents with multiple winners and release discarded beams."""
+        selections_by_parent: dict[int, List[tuple[int, float, int]]] = {}
+        for output_index, (score, parent_index, token_id) in enumerate(candidates):
+            selections_by_parent.setdefault(parent_index, []).append(
+                (output_index, score, token_id)
+            )
+
+        child_slots: List[Optional[Seq]] = [None] * len(candidates)
+        child_scores = [0.0] * len(candidates)
+        for parent_index, parent in enumerate(parents):
+            selections = selections_by_parent.get(parent_index, [])
+            if not selections:
+                self.kv_manager.remove_seq(parent)
+                continue
+
+            # Reuse the parent for one winner. Only additional children need a
+            # cache fork; copy-on-write then duplicates a partial block exactly
+            # when two surviving hypotheses truly diverge.
+            branches = [parent]
+            branches.extend(
+                self.kv_manager.fork_sequence(parent)
+                for _ in range(len(selections) - 1)
+            )
+            for branch, (output_index, score, token_id) in zip(
+                branches, selections
+            ):
+                branch.append_token(token_id)
+                self.kv_manager.append_to_seq(branch)
+                child_slots[output_index] = branch
+                child_scores[output_index] = score
+
+        if any(child is None for child in child_slots):
+            raise RuntimeError("failed to construct every selected beam branch")
+        children = [child for child in child_slots if child is not None]
+
+        self.current_sequences = children
+        return children, child_scores
+
+    def _generate_beams(
+        self,
+        logits: torch.Tensor,
+        sequence: Seq,
+        prompt_tokens: List[int],
+        max_new_tokens: int,
+        num_beams: int,
+        length_penalty: float,
+        stop_tokens: Optional[List[int]],
+        tts_mel_embedding: Optional[torch.nn.Module],
+        tts_text_pos_embedding: Optional[torch.nn.Module],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Decode one prompt with paged-cache beam search or beam sampling."""
+        stop_token_set = set(stop_tokens or [])
+        completed: List[tuple[float, float, List[int]]] = []
+        active_sequences = [sequence]
+        active_scores = [0.0]
+
+        for generated_step in range(max_new_tokens):
+            score_tensor = torch.tensor(
+                active_scores, dtype=torch.float32, device=logits.device
+            )
+            ranked = self._beam_candidates(
+                logits, active_sequences, score_tensor, num_beams
+            )
+            best_step_score = ranked[0][0]
+
+            active_candidates: List[tuple[float, int, int]] = []
+            for rank, (score, parent_index, token_id) in enumerate(ranked):
+                parent = active_sequences[parent_index]
+                parent_generated = parent.token_ids[parent.num_prompt_tokens :]
+                if token_id in stop_token_set:
+                    # Match Transformers: only EOS candidates ranked within the
+                    # beam width become completed hypotheses.
+                    if rank < num_beams:
+                        generated_length = len(parent_generated) + 1
+                        normalized = self._normalized_beam_score(
+                            score, generated_length, length_penalty
+                        )
+                        completed.append(
+                            (normalized, score, copy.copy(parent_generated))
+                        )
+                    continue
+
+                if len(active_candidates) < num_beams:
+                    active_candidates.append((score, parent_index, token_id))
+
+            completed.sort(key=lambda item: item[0], reverse=True)
+            if len(completed) > num_beams:
+                completed = completed[:num_beams]
+
+            if not active_candidates:
+                for active in active_sequences:
+                    self.kv_manager.remove_seq(active)
+                self.current_sequences = []
+                active_sequences = []
+                active_scores = []
+                break
+
+            active_sequences, active_scores = self._branch_beam_sequences(
+                active_sequences, active_candidates
+            )
+
+            if generated_step + 1 >= max_new_tokens:
+                break
+
+            if len(completed) >= num_beams:
+                current_length = generated_step + 1
+                best_active = self._normalized_beam_score(
+                    best_step_score, current_length, length_penalty
+                )
+                worst_completed = completed[-1][0]
+                if worst_completed >= best_active:
+                    break
+
+            decode_ids, decode_pos = self._prepare_decode(active_sequences)
+            context = get_forward_context()
+            hidden_states = self._run_decode_with_graph(
+                decode_ids,
+                decode_pos,
+                context,
+                tts_mel_embedding=tts_mel_embedding,
+                tts_text_pos_embedding=tts_text_pos_embedding,
+            )
+            logits = self._compute_logits(hidden_states)
+            reset_forward_context()
+
+        for active, score in zip(active_sequences, active_scores):
+            generated = active.token_ids[active.num_prompt_tokens :]
+            normalized = self._normalized_beam_score(
+                score, len(generated), length_penalty
+            )
+            completed.append((normalized, score, copy.copy(generated)))
+
+        for active in active_sequences:
+            if active.block_table:
+                self.kv_manager.remove_seq(active)
+        self.current_sequences = []
+
+        if not completed:
+            best_tokens: List[int] = []
+        else:
+            best_tokens = max(completed, key=lambda item: item[0])[2]
+        return torch.tensor(
+            [prompt_tokens + best_tokens], dtype=torch.long, device=device
+        )
 
     def reset_model_state(self) -> None:
         """Invalidate state tied to the currently loaded GPT checkpoint."""
@@ -478,6 +677,8 @@ class AccelInferenceEngine:
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
         do_sample: bool = True,
+        num_beams: int = 1,
+        length_penalty: float = 1.0,
         stop_tokens: Optional[List[int]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         tts_embeddings: Optional[
@@ -497,6 +698,8 @@ class AccelInferenceEngine:
             temperature: Sampling temperature
             top_k: Top-k sampling
             top_p: Nucleus sampling threshold
+            num_beams: Number of beam hypotheses to retain
+            length_penalty: Exponent used to normalize completed beam scores
             stop_tokens: List of token IDs that stop generation
 
         Returns:
@@ -508,6 +711,11 @@ class AccelInferenceEngine:
             raise ValueError("top_p must be between zero and one")
         if repetition_penalty <= 0:
             raise ValueError("repetition_penalty must be greater than zero")
+        if int(num_beams) < 1:
+            raise ValueError("num_beams must be at least one")
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least one")
+        num_beams = int(num_beams)
 
         self._gen_temperature = float(temperature)
         self._gen_top_k = top_k
@@ -517,6 +725,10 @@ class AccelInferenceEngine:
 
         batch_size = input_ids.size(0)
         device = input_ids.device
+        if num_beams > 1 and batch_size != 1:
+            raise NotImplementedError(
+                "accelerated beam search currently supports one prompt at a time"
+            )
 
         self._tts_mode = tts_embeddings is not None
         self._tts_prompt_len = input_ids.size(1) if self._tts_mode else 0
@@ -633,6 +845,19 @@ class AccelInferenceEngine:
         reset_forward_context()
 
         logits = self._compute_logits(last_hidden)
+        if num_beams > 1:
+            return self._generate_beams(
+                logits=logits,
+                sequence=sequences[0],
+                prompt_tokens=input_ids[0].tolist(),
+                max_new_tokens=max_new_tokens,
+                num_beams=num_beams,
+                length_penalty=float(length_penalty),
+                stop_tokens=stop_tokens,
+                tts_mel_embedding=tts_mel_embedding,
+                tts_text_pos_embedding=tts_text_pos_embedding,
+                device=device,
+            )
         first_token = self._sample_tokens(logits, sequences)
 
         first_token_list = first_token.tolist()
@@ -732,16 +957,3 @@ class AccelInferenceEngine:
         )
 
         return output
-
-
-class Sampler(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
-        logits = logits.float().div_(temperatures.unsqueeze(dim=1))
-        probs = torch.softmax(logits, dim=-1)
-        sample_tokens = probs.div_(
-            torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
-        ).argmax(dim=-1)
-        return sample_tokens
