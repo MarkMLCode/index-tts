@@ -100,7 +100,7 @@ class TextNormalizer:
     """
 
     # 匹配常见英语缩写 's，仅用于替换为 is，不匹配所有 's
-    ENGLISH_CONTRACTION_PATTERN = r"(what|where|who|which|how|t?here|it|s?he|that|this)'s"
+    ENGLISH_CONTRACTION_PATTERN = r"(this)'s"
 
 
     def use_chinese(self, s):
