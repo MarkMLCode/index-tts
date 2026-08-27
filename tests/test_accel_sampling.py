@@ -248,6 +248,17 @@ class AccelSamplingParityTests(unittest.TestCase):
         self.assertTrue(engine.kv_manager.reset_called)
         self.assertIsNone(engine._lm_head_fp32)
 
+    def test_resident_switch_preserves_cached_float32_head(self) -> None:
+        engine = sampling_engine()
+        engine.current_sequences = []
+        reset_calls = []
+        engine.kv_manager = type("Manager", (), {"reset": lambda self: reset_calls.append(True)})()
+        head = nn.Linear(2, 2)
+        engine._lm_head_fp32 = head
+        engine.reset_model_state(weights_changed=False)
+        self.assertEqual(reset_calls, [True])
+        self.assertIs(engine._lm_head_fp32, head)
+
 
 if __name__ == "__main__":
     unittest.main()

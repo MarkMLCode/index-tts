@@ -13,11 +13,12 @@ import time
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 API_IMPORT_STARTED = time.perf_counter()
 
 from indextts.runtime_logging import configure_run_logging, timed_stage
+from indextts.utils.seed import apply_seed, normalize_seed
 
 import numpy as np
 import soundfile as sf
@@ -49,6 +50,7 @@ SUPPORTED_MEDIA_TYPES = {"wav", "raw", "ogg", "aac"}
 CURRENT_ENGINE: Optional[Any] = None
 CURRENT_MODEL_SPEC: Optional[Tuple[Any, ...]] = None
 CURRENT_GPT_PATH: Optional[str] = None
+CURRENT_WARMED_GPT_PATHS: set[str] = set()
 
 
 def _resolve_existing_file(path: str, description: str) -> str:
@@ -72,6 +74,11 @@ def _release_engine_locked() -> None:
     CURRENT_ENGINE = None
     CURRENT_MODEL_SPEC = None
     CURRENT_GPT_PATH = None
+    CURRENT_WARMED_GPT_PATHS.clear()
+    _collect_accelerator_memory()
+
+
+def _collect_accelerator_memory() -> None:
     gc.collect()
 
     # Importing torch is intentionally delayed so importing api.py stays light.
@@ -92,6 +99,31 @@ def get_engine() -> Any:
     return CURRENT_ENGINE
 
 
+def _resolve_warmup_speaker(speaker: Optional[str]) -> str:
+    if speaker is not None:
+        return _resolve_existing_file(speaker, "warmup speaker audio")
+    project_root = Path(__file__).resolve().parent
+    for relative in ("voicelines/ref/lute_sovits_24_dist.wav", "examples/voice_01.wav"):
+        candidate = project_root / relative
+        if candidate.is_file():
+            return str(candidate)
+    raise FileNotFoundError("No warmup reference audio found; supply warmup_speaker or set warmup=false")
+
+
+def _warmup_loaded_models_locked(engine, speaker: Optional[str]) -> None:
+    loaded = tuple(engine.loaded_gpt_checkpoints)
+    CURRENT_WARMED_GPT_PATHS.intersection_update(loaded)
+    pending = [path for path in loaded if path not in CURRENT_WARMED_GPT_PATHS]
+    if speaker is None:
+        STARTUP_LOGGER.info("Generation warmup disabled")
+    elif pending:
+        from indextts.utils.warmup import warmup_engine
+        warmup_engine(engine, pending, speaker)
+        CURRENT_WARMED_GPT_PATHS.update(pending)
+    else:
+        STARTUP_LOGGER.info("Generation warmup already completed for all resident checkpoints")
+
+
 @timed_stage("load_model total (including validation and lock wait)")
 def load_model(
     *,
@@ -106,6 +138,8 @@ def load_model(
     use_accel: bool = False,
     use_torch_compile: bool = False,
     use_qwen_emo: bool = False,
+    warmup: bool = True,
+    warmup_speaker: Optional[str] = None,
 ) -> str:
     """Load the requested resident GPT set and activate its main checkpoint."""
     config_path = _resolve_existing_file(config, "config file")
@@ -145,6 +179,7 @@ def load_model(
         use_torch_compile,
         use_qwen_emo,
     )
+    resolved_warmup_speaker = _resolve_warmup_speaker(warmup_speaker) if warmup else None
 
     STARTUP_LOGGER.info(
         "Loading %d resident GPT checkpoint(s); main=%s; device=%s; "
@@ -164,36 +199,32 @@ def load_model(
                 for loaded_path in tuple(CURRENT_ENGINE.loaded_gpt_checkpoints):
                     if os.path.normcase(loaded_path) not in requested_keys:
                         CURRENT_ENGINE.unload_gpt_checkpoint(loaded_path)
-            CURRENT_GPT_PATH = str(Path(CURRENT_ENGINE.gpt_path).resolve())
-            STARTUP_LOGGER.info("Models ready: resident=%d; active=%s", len(CURRENT_ENGINE.loaded_gpt_checkpoints), CURRENT_GPT_PATH)
-            return CURRENT_GPT_PATH
-
-        # Runtime-setting changes require rebuilding the shared non-GPT stack.
-        # GPT-only changes take the cache path above instead.
-        with timed_stage("Release previous engine and accelerator cache"):
-            _release_engine_locked()
-
-        with timed_stage("Import inference dependencies"):
-            from indextts.infer_v2_5 import IndexTTS2
-
-        engine = IndexTTS2(
-            cfg_path=config_path,
-            model_dir=model_dir_path,
-            gpt_checkpoint_path=main_gpt_path,
-            gpt_checkpoint_paths=requested_gpt_paths,
-            device=device,
-            use_bf16=use_bf16,
-            use_cuda_kernel=use_cuda_kernel,
-            use_deepspeed=use_deepspeed,
-            use_accel=use_accel,
-            use_torch_compile=use_torch_compile,
-            use_qwen_emo=use_qwen_emo,
-        )
-        CURRENT_ENGINE = engine
-        CURRENT_MODEL_SPEC = model_spec
+            engine = CURRENT_ENGINE
+        else:
+            # Runtime-setting changes rebuild the shared speech stack.
+            with timed_stage("Release previous engine and accelerator cache"):
+                _release_engine_locked()
+            with timed_stage("Import inference dependencies"):
+                from indextts.infer_v2_5 import IndexTTS2
+            engine = IndexTTS2(
+                cfg_path=config_path,
+                model_dir=model_dir_path,
+                gpt_checkpoint_path=main_gpt_path,
+                gpt_checkpoint_paths=requested_gpt_paths,
+                device=device,
+                use_bf16=use_bf16,
+                use_cuda_kernel=use_cuda_kernel,
+                use_deepspeed=use_deepspeed,
+                use_accel=use_accel,
+                use_torch_compile=use_torch_compile,
+                use_qwen_emo=use_qwen_emo,
+            )
+            CURRENT_ENGINE = engine
+            CURRENT_MODEL_SPEC = model_spec
         CURRENT_GPT_PATH = str(Path(engine.gpt_path).resolve())
+        _warmup_loaded_models_locked(engine, resolved_warmup_speaker)
         STARTUP_LOGGER.info(
-            "Models ready: resident=%d; active=%s; generation warmup has not been run",
+            "Models ready: resident=%d; active=%s",
             len(engine.loaded_gpt_checkpoints), CURRENT_GPT_PATH,
         )
         return CURRENT_GPT_PATH
@@ -216,16 +247,8 @@ def unload_model(gpt_checkpoint: str) -> str:
     with MODEL_LOCK:
         engine = get_engine()
         unloaded = engine.unload_gpt_checkpoint(resolved)
-        gc.collect()
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            if hasattr(torch, "xpu") and torch.xpu.is_available():
-                torch.xpu.empty_cache()
-        except (ImportError, RuntimeError):
-            LOGGER.debug("Unable to empty the accelerator cache", exc_info=True)
+        CURRENT_WARMED_GPT_PATHS.discard(unloaded)
+        _collect_accelerator_memory()
         return unloaded
 
 
@@ -248,8 +271,8 @@ def validate_emo_vector(emo_vector: Optional[List[float]]) -> Optional[List[floa
         raise ValueError("emotion vector elements must be finite")
     if any(value < 0 for value in values):
         raise ValueError("emotion vector elements cannot be negative")
-    if sum(values) > 0.8 + 1e-9:
-        raise ValueError("emotion vector sum cannot exceed 0.8")
+    if sum(values) > 1.5 + 1e-9:
+        raise ValueError("emotion vector sum cannot exceed 1.5")
     return values
 
 
@@ -283,6 +306,7 @@ def generate_audio(
     gpt_checkpoint: Optional[str] = None,
     speaker: str,
     text: str,
+    seed: int = -1,
     lang: str = "ZH",
     emo_audio_prompt: Optional[str] = None,
     emo_alpha: float = 1.0,
@@ -335,6 +359,9 @@ def generate_audio(
             CURRENT_GPT_PATH = engine.set_gpt_checkpoint(
                 selected, load_if_missing=False
             )
+        seed = normalize_seed(seed)
+        apply_seed(seed)
+        STARTUP_LOGGER.info("Generation seed: %d", seed)
         result = engine.infer(
             spk_audio_prompt=speaker,
             text=text,
@@ -425,6 +452,8 @@ class LoadModelRequest(APIRequest):
     use_accel: bool = False
     use_torch_compile: bool = False
     use_qwen_emo: bool = False
+    warmup: bool = True
+    warmup_speaker: Optional[str] = None
 
 
 class GPTCheckpointRequest(APIRequest):
@@ -435,6 +464,7 @@ class GenerateRequest(APIRequest):
     gpt_checkpoint: str
     speaker: str
     text: str
+    seed: int = -1
     lang: str = "ZH"
     emo_audio_prompt: Optional[str] = None
     emo_alpha: float = 1.0
@@ -464,34 +494,28 @@ def _model_dump(model: BaseModel) -> Dict[str, Any]:
     return cast(Dict[str, Any], model.dict())
 
 
+def _checkpoint_response(action: Callable[..., str], failure_message: str, **kwargs):
+    """Keep model-management responses and error translation consistent."""
+    try:
+        return {"message": "success", "gpt_checkpoint": action(**kwargs)}
+    except Exception as exc:
+        LOGGER.exception(failure_message)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @APP.post("/load_model")
 def load_model_endpoint(request: LoadModelRequest):
-    try:
-        gpt_path = load_model(**_model_dump(request))
-    except Exception as exc:
-        LOGGER.exception("Model loading failed")
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"message": "success", "gpt_checkpoint": gpt_path}
+    return _checkpoint_response(load_model, "Model loading failed", **_model_dump(request))
 
 
 @APP.post("/switch_model")
 def switch_model_endpoint(request: GPTCheckpointRequest):
-    try:
-        gpt_path = switch_model(request.gpt_checkpoint)
-    except Exception as exc:
-        LOGGER.exception("Model switch failed")
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"message": "success", "gpt_checkpoint": gpt_path}
+    return _checkpoint_response(switch_model, "Model switch failed", **_model_dump(request))
 
 
 @APP.post("/unload_model")
 def unload_model_endpoint(request: GPTCheckpointRequest):
-    try:
-        gpt_path = unload_model(request.gpt_checkpoint)
-    except Exception as exc:
-        LOGGER.exception("Model unload failed")
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"message": "success", "gpt_checkpoint": gpt_path}
+    return _checkpoint_response(unload_model, "Model unload failed", **_model_dump(request))
 
 
 @APP.get("/models")
@@ -510,6 +534,7 @@ def generate_endpoint(request: GenerateRequest):
         raise HTTPException(status_code=400, detail=f"media_type '{media_type}' is not supported")
 
     try:
+        values["seed"] = normalize_seed(values["seed"])
         sampling_rate, audio_array = generate_audio(**values)
         if audio_array.ndim == 1:
             audio_array = audio_array.reshape(-1, 1)
@@ -517,7 +542,10 @@ def generate_endpoint(request: GenerateRequest):
     except Exception as exc:
         LOGGER.exception("Audio generation failed")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return Response(content=audio_bytes, media_type=f"audio/{media_type}")
+    return Response(
+        content=audio_bytes, media_type=f"audio/{media_type}",
+        headers={"X-Seed": str(values["seed"])},
+    )
 
 
 @APP.get("/tts")
@@ -554,7 +582,6 @@ def tts_get_endpoint(
         batch_threshold,
         split_bucket,
         fragment_interval,
-        seed,
         streaming_mode,
         parallel_infer,
         sample_steps,
@@ -575,6 +602,7 @@ def tts_get_endpoint(
         speaker=ref_audio_path,
         text=text,
         lang=text_lang or "ZH",
+        seed=seed,
         top_k=top_k,
         top_p=top_p,
         repetition_penalty=repetition_penalty,

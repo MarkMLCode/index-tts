@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, TextIO
@@ -16,6 +17,17 @@ from typing import Optional, TextIO
 LOGGER = logging.getLogger("indextts.startup")
 _CONFIG_LOCK = threading.Lock()
 _RUN_LOG_DIR: Optional[Path] = None
+_FILE_ONLY_OUTPUT = ContextVar("indextts_file_only_output", default=False)
+
+
+@contextmanager
+def file_only_output():
+    """Keep warmup prints in the file without hiding other threads' output."""
+    token = _FILE_ONLY_OUTPUT.set(True)
+    try:
+        yield
+    finally:
+        _FILE_ONLY_OUTPUT.reset(token)
 
 
 class _PrintLoggingStream:
@@ -34,7 +46,8 @@ class _PrintLoggingStream:
 
     def write(self, message: str) -> int:
         with self._lock:
-            self._original.write(message)
+            if not _FILE_ONLY_OUTPUT.get():
+                self._original.write(message)
             self._buffer += message.replace("\r", "\n")
             lines = self._buffer.split("\n")
             self._buffer = lines.pop()
@@ -52,6 +65,20 @@ class _PrintLoggingStream:
 
     def __getattr__(self, name: str):
         return getattr(self._original, name)
+
+
+def _configure_logger(name, handlers, level=logging.INFO):
+    logger = logging.getLogger(name)
+    logger.handlers = list(handlers)
+    logger.setLevel(level)
+    logger.propagate = False
+    return logger
+
+
+def _console_handler(stream, formatter):
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(formatter)
+    return handler
 
 
 def configure_run_logging(log_root: Optional[Path] = None) -> Path:
@@ -73,8 +100,6 @@ def configure_run_logging(log_root: Optional[Path] = None) -> Path:
         )
         file_handler = logging.FileHandler(run_dir / "api.log", encoding="utf-8")
         file_handler.setFormatter(formatter)
-        console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.setFormatter(logging.Formatter("%(levelname)s [%(name)s] %(message)s"))
         root_logger = logging.getLogger()
         root_logger.setLevel(logging.INFO)
         # Respect existing embedding/application handlers; add a console only if
@@ -84,26 +109,26 @@ def configure_run_logging(log_root: Optional[Path] = None) -> Path:
             and not isinstance(handler, logging.FileHandler)
             for handler in root_logger.handlers
         ):
-            root_logger.addHandler(console_handler)
+            root_logger.addHandler(_console_handler(sys.stderr, logging.Formatter("%(levelname)s [%(name)s] %(message)s")))
         root_logger.addHandler(file_handler)
 
         # Added diagnostics belong only in the run file. Do not propagate them
         # to root handlers, including consoles configured by an embedding app.
-        LOGGER.handlers = [file_handler]
-        LOGGER.setLevel(logging.INFO)
-        LOGGER.propagate = False
+        _configure_logger(LOGGER.name, [file_handler])
 
+        # Match Uvicorn's original console formatting, colors and streams.
+        # Keep its logger names/timestamps only in the separate file handler.
+        from uvicorn.logging import AccessFormatter, DefaultFormatter
+
+        server_handler = _console_handler(sys.stderr, DefaultFormatter("%(levelprefix)s %(message)s"))
+        access_handler = _console_handler(sys.stdout, AccessFormatter(
+            '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+        ))
         for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-            logger = logging.getLogger(name)
-            logger.handlers = [console_handler, file_handler]
-            logger.setLevel(logging.INFO)
-            logger.propagate = False
+            _configure_logger(name, [access_handler if name == "uvicorn.access" else server_handler, file_handler])
 
         for stream_name, level in (("stdout", logging.INFO), ("stderr", logging.WARNING)):
-            logger = logging.getLogger(f"indextts.{stream_name}")
-            logger.handlers = [file_handler]
-            logger.setLevel(level)
-            logger.propagate = False
+            logger = _configure_logger(f"indextts.{stream_name}", [file_handler], level)
             setattr(sys, stream_name, _PrintLoggingStream(logger, getattr(sys, stream_name), level))
 
         _RUN_LOG_DIR = run_dir

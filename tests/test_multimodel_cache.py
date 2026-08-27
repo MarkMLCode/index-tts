@@ -12,7 +12,7 @@ class FakeAccelEngine:
     def __init__(self):
         self.reset_count = 0
 
-    def reset_model_state(self):
+    def reset_model_state(self, *, weights_changed=True):
         self.reset_count += 1
 
 
@@ -183,33 +183,6 @@ def test_only_bit_identical_conditioning_modules_are_shared():
     assert "emo_layer" not in shared
     assert candidate.spk_emb_proj is reference.spk_emb_proj
     assert candidate.emo_layer is not reference.emo_layer
-
-
-def test_single_resident_model_is_replaced_in_place(tmp_path):
-    old_path = tmp_path / "old.pth"
-    new_path = tmp_path / "new.pth"
-    old_path.touch()
-    old_path = str(old_path.resolve())
-    source = nn.Module()
-    source.layer = nn.Linear(2, 2)
-    torch.save({"model": source.state_dict()}, new_path)
-
-    runtime = object.__new__(IndexTTS2)
-    resident = nn.Module()
-    resident.layer = nn.Linear(2, 2)
-    resident.accel_engine = None
-    runtime.gpt = resident
-    runtime.gpt_path = old_path
-    runtime._gpt_models = {old_path: resident}
-    runtime.use_deepspeed = False
-
-    selected = runtime.replace_gpt_checkpoint(new_path)
-
-    assert selected == str(new_path.resolve())
-    assert runtime.gpt is resident
-    assert runtime.loaded_gpt_checkpoints == (selected,)
-    assert torch.equal(resident.layer.weight, source.layer.weight)
-    assert torch.equal(resident.layer.bias, source.layer.bias)
 
 
 def test_single_resident_model_is_replaced_in_place(tmp_path):

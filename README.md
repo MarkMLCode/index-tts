@@ -186,16 +186,9 @@ uv run webui.py --version 2 --model_dir ./checkpoints_2
 
 Open your browser and visit `http://127.0.0.1:7860` to see the demo.
 
-The WebUI can refresh and switch among GPT checkpoints in `checkpoints`,
-`models`, and `_trained` without reloading the shared audio models. **Load / Switch**
-replaces an uncached model in-place, while switching to a resident model only
-replaces the active GPT reference. Use **Preload Selected** to retain several
-models in VRAM and **Unload Inactive** to release them. It remembers the last
-successfully
-loaded checkpoint in the ignored local file `.webui_settings.json`. Advanced
-generation controls include a reproducible
-seed (`-1` chooses a fresh random seed), and **Realtime streaming playback**
-plays each completed segment while the full WAV continues generating.
+Use **Load / Switch** to select a GPT checkpoint, **Preload Selected** to keep
+multiple models in VRAM, and **Unload Inactive** to free them. Advanced controls
+include `seed` (`-1` for random) and **Realtime streaming playback**.
 
 You can adjust the settings to enable BF16 (IndexTTS-2.5) / FP16 (IndexTTS-2)
 inference (lower VRAM usage), DeepSpeed acceleration, compiled CUDA kernels for
@@ -222,29 +215,14 @@ For production deployment, see the [vLLM recipe for IndexTTS](https://recipes.vl
 
 ### 🌐 HTTP API
 
-`api.py` keeps one shared IndexTTS2.5 speech stack plus any requested resident
-GPT checkpoints in memory, and serializes loading, switching, and inference.
-Start it with:
+Start the API:
 
 ```bash
 uv run api.py --bind-addr 127.0.0.1 --port 9880
 ```
 
-Each API process saves timestamped Python output and server logs to
-`logs/<timestamp>_<pid>/api.log` (override the root with `INDEXTTS_API_LOG_DIR`).
-Added diagnostic messages, wall-clock timestamps (including milliseconds), and
-`elapsed=...s` timings appear only in the log file. The console retains the
-original model output, server messages, and API errors. The file includes
-timings for each GPT's construction, checkpoint read,
-weight assignment, device transfer, acceleration setup, and exact module
-sharing, plus the shared speech models and BigVGAN kernel import/build.
-`load_model total` includes validation, model-lock waiting, dependency imports,
-and initialization; it is separate from API application startup. Nested totals
-overlap, so do not add them together. Timings measure host elapsed time without
-adding GPU synchronizations. Native compiler subprocess output may only appear
-in the console, but its elapsed time is included in the kernel stage.
-Generation and explicit model switches also have total timers. This logging
-does not add a warmup generation or change inference settings.
+Logs are saved to `logs/<timestamp>_<pid>/api.log`; extra diagnostics and timings
+are file-only. Set `INDEXTTS_API_LOG_DIR` to change the log directory.
 
 Load one or more GPT checkpoints and choose the main one. When the list contains
 only one checkpoint, `main_gpt_checkpoint` may be omitted:
@@ -255,7 +233,11 @@ curl -X POST http://127.0.0.1:9880/load_model \
   -d '{"model_dir":"checkpoints","config":"checkpoints/config.yaml","use_bf16":true,"gpt_checkpoint_paths":["_trained/voice-a.pth","_trained/voice-b.pth"],"main_gpt_checkpoint":"_trained/voice-a.pth"}'
 ```
 
-Switch to a resident checkpoint without loading or copying its weights:
+Loading warms up each new model by default. Use `warmup_speaker` to specify
+reference audio, or `warmup: false` to skip (also use these if default warmup
+audio is unavailable). DeepSpeed does not support multi-model loading.
+
+Switch to a preloaded checkpoint:
 
 ```bash
 curl -X POST http://127.0.0.1:9880/switch_model \
@@ -263,33 +245,22 @@ curl -X POST http://127.0.0.1:9880/switch_model \
   -d '{"gpt_checkpoint":"_trained/voice-b.pth"}'
 ```
 
-`GET /models` reports the active and resident checkpoints. POST a checkpoint
-to `/unload_model` to release an inactive model. Calling `/load_model` again
-with the same runtime settings updates the exact resident set without
-reconstructing the shared speech stack.
+`GET /models` lists loaded checkpoints. `POST /unload_model` takes the same
+`gpt_checkpoint` field to release an inactive model.
 
 Generate audio from the loaded model:
 
 ```bash
 curl -X POST http://127.0.0.1:9880/generate \
   -H "Content-Type: application/json" \
-  -d '{"gpt_checkpoint":"_trained/voice-b.pth","speaker":"examples/voice_01.wav","text":"Hello world","lang":"EN","media_type":"wav"}' \
+  -d '{"gpt_checkpoint":"_trained/voice-b.pth","speaker":"examples/voice_01.wav","text":"Hello world","lang":"EN","seed":42,"media_type":"wav"}' \
   --output gen.wav
 ```
 
-The server also provides the GPT-SoVITS-compatible `GET /tts` endpoint and
-supports `wav`, `raw`, `ogg`, and `aac` responses. AAC output requires the
-`ffmpeg` executable. Each `/generate` request selects one of the resident GPT
-checkpoints atomically with inference, so concurrent requests cannot mix models.
-
-Resident models use the same precision and weights as single-model inference;
-no quantization or CPU offload is introduced. The non-GPT semantic, codec,
-S2Mel, CAMPPlus, BigVGAN, and emotion components are shared. With `use_accel`,
-cached GPTs also share their KV workspace and omit the redundant standard GPT
-transformer copy. Frozen GPT conditioning modules are interned only when their
-tensors are bit-identical. DeepSpeed does not support resident multi-model
-switching. The first generation from each accelerated checkpoint may capture
-its CUDA graph; later model switches are immediate.
+Both `/generate` and the GPT-SoVITS-compatible `GET /tts` accept `seed`
+(`-1` or omitted for random) and return the chosen value in `X-Seed`.
+Supported audio formats are `wav`, `raw`, `ogg`, and `aac` (requires `ffmpeg`).
+See `http://127.0.0.1:9880/docs` for all request options.
 
 ### 📝 Python API
 

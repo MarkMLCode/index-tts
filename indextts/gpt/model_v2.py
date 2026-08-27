@@ -426,6 +426,7 @@ class UnifiedVoice(nn.Module):
         half=False,
         accel_dtype=None,
         accel_kv_manager=None,
+        reuse_gpt_weights=False,
     ):
         seq_length = self.max_mel_tokens + self.max_text_tokens + 2
         gpt_config = GPT2Config(
@@ -448,14 +449,17 @@ class UnifiedVoice(nn.Module):
 
             from indextts.accel import GPT2AccelModel, AccelInferenceEngine
 
-            # Create accel model
-            accel_gpt = GPT2AccelModel(gpt_config)
-            accel_gpt.load_state_dict(self.gpt.state_dict(), strict=False)
-
             if accel_dtype is None and half:
                 accel_dtype = torch.float16
-            accel_gpt = accel_gpt.to(device="cuda", dtype=accel_dtype)
-            accel_gpt.eval()
+            if reuse_gpt_weights:
+                accel_gpt = GPT2AccelModel.from_standard_model(
+                    gpt_config, self.gpt, dtype=accel_dtype or torch.float32, device="cuda",
+                )
+            else:
+                accel_gpt = GPT2AccelModel(gpt_config)
+                accel_gpt.load_state_dict(self.gpt.state_dict(), strict=False)
+                accel_gpt = accel_gpt.to(device="cuda", dtype=accel_dtype)
+                accel_gpt.eval()
 
             lm_head_with_norm = nn.Sequential(self.final_norm, self.mel_head)
             self.accel_engine = AccelInferenceEngine(

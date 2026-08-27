@@ -76,9 +76,10 @@ def test_per_run_logs_capture_prints_and_uvicorn_once_with_timestamps(tmp_path, 
     script = """
 import logging
 import sys
+import threading
 from pathlib import Path
 import api
-from indextts.runtime_logging import configure_run_logging, timed_stage
+from indextts.runtime_logging import configure_run_logging, timed_stage, file_only_output
 root = Path(sys.argv[1])
 if sys.argv[2] == 'True':
     handler = logging.StreamHandler(sys.stderr)
@@ -89,9 +90,15 @@ assert configure_run_logging(root) == run
 print('stdout marker')
 print('stderr marker', file=sys.stderr)
 logging.getLogger('uvicorn.error').info('server marker')
-logging.getLogger('uvicorn.access').info('access marker')
+logging.getLogger('uvicorn.access').info('%s - "%s %s HTTP/%s" %d', '127.0.0.1:12345', 'GET', '/access-marker', '1.1', 200)
 api.STARTUP_LOGGER.info('startup diagnostic marker')
 api.LOGGER.error('api error marker')
+with file_only_output():
+    print('warmup stdout marker')
+    print('warmup stderr marker', file=sys.stderr)
+    other = threading.Thread(target=lambda: print('other thread marker'))
+    other.start()
+    other.join()
 with timed_stage('test load'):
     logging.getLogger('api').info('model marker')
 try:
@@ -113,19 +120,23 @@ logging.shutdown()
     assert len(logs) == 1
     content = logs[0].read_text(encoding="utf-8")
     console = result.stdout + result.stderr
-    for marker in ("stdout marker", "stderr marker", "server marker", "access marker", "model marker", "partial marker", "api error marker"):
+    for marker in ("server marker", "access-marker", "model marker", "partial marker", "api error marker", "other thread marker"):
         assert content.count(marker) == 1
         assert console.count(marker) == 1
     for line in content.splitlines():
         assert re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} ", line)
     assert not re.search(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", console, re.MULTILINE)
-    assert "INFO [uvicorn.error] server marker" in console
-    assert "INFO [uvicorn.access] access marker" in console
+    assert "INFO:     server marker" in result.stderr
+    assert 'INFO:     127.0.0.1:12345 - "GET /access-marker HTTP/1.1" 200 OK' in result.stdout
+    assert "[uvicorn" not in console
+    assert "[uvicorn.error] server marker" in content
+    assert "[uvicorn.access]" in content
     assert "INFO [api] model marker" in console
     for marker in (
         "Run log:", "Stage timings are host elapsed time", "startup diagnostic marker",
         "START test load", "DONE test load | elapsed=",
         "START test failure", "FAILED test failure | elapsed=",
+        "warmup stdout marker", "warmup stderr marker",
     ):
         assert content.count(marker) == 1
         assert marker not in console

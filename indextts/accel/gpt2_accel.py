@@ -133,6 +133,37 @@ class GPT2AccelBlock(GPT2Block):
 
 
 class GPT2AccelModel(GPT2Model):
+    @classmethod
+    def from_standard_model(cls, config, standard_model, *, dtype, device):
+        """Build the inference wrapper around already-loaded transformer weights.
+
+        Only the unused built-in embeddings need initialization: TTS supplies
+        its own embeddings/positions. All transformer parameters must be present.
+        The caller must not train/mutate the standard model after sharing it.
+        """
+        from accelerate import init_empty_weights
+        from indextts.runtime_logging import timed_stage
+
+        with timed_stage("Accel empty module construction"):
+            with init_empty_weights(include_buffers=False):
+                model = cls(config)
+        state = standard_model.state_dict()
+        missing = model.state_dict().keys() - state.keys()
+        if missing - {"wte.weight", "wpe.weight"}:
+            raise ValueError(f"Incomplete acceleration weights: {sorted(missing)}")
+        # These embeddings are unused by TTS but retain the generic input_ids
+        # path. Do not leave meta tensors in the resident model.
+        for name in ("wte", "wpe"):
+            if f"{name}.weight" in missing:
+                empty = getattr(model, name)
+                embedding = nn.Embedding(empty.num_embeddings, empty.embedding_dim)
+                model._init_weights(embedding)
+                setattr(model, name, embedding)
+        with timed_stage("Accel weight attachment and device setup"):
+            model.load_state_dict(state, strict=False, assign=True)
+            model = model.to(device=device, dtype=dtype)
+        return model.eval()
+
     def __init__(self, config):
         super().__init__(config)
         self.h = nn.ModuleList(

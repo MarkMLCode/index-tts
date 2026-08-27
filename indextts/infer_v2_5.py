@@ -21,7 +21,7 @@ from omegaconf import OmegaConf
 
 from indextts.codec.models import EnhancedCodec
 from indextts.gpt.model_v2 import UnifiedVoice
-from indextts.utils.checkpoint import load_checkpoint
+from indextts.utils.checkpoint import load_inference_model, read_checkpoint_state
 from indextts.runtime_logging import timed_stage
 from indextts.utils.common import save_pcm_wav
 from indextts.utils.front import TextNormalizer
@@ -334,13 +334,14 @@ class IndexTTS2:
 
     def _build_gpt_model(self, checkpoint_path):
         with timed_stage(f"GPT model total: {checkpoint_path}"):
-            with timed_stage("GPT module construction"):
-                model = UnifiedVoice(
+            model = load_inference_model(
+                lambda: UnifiedVoice(
                     **self.cfg.gpt,
                     use_accel=self.use_accel,
                     spk_cond_mode="campplus",
-                )
-            load_checkpoint(model, checkpoint_path)
+                ),
+                checkpoint_path,
+            )
             with timed_stage(f"GPT device transfer and precision setup ({self.device})"):
                 model = model.to(self.device)
                 if self.use_bf16:
@@ -356,6 +357,7 @@ class IndexTTS2:
                     half=self.use_bf16,
                     accel_dtype=self.dtype,
                     accel_kv_manager=self._shared_accel_kv_manager,
+                    reuse_gpt_weights=True,
                 )
             if model.accel_engine is not None:
                 with timed_stage("Release redundant standard GPT transformer"):
@@ -425,23 +427,7 @@ class IndexTTS2:
 
     @staticmethod
     def _checkpoint_state(checkpoint_path):
-        try:
-            payload = torch.load(
-                checkpoint_path,
-                map_location="cpu",
-                weights_only=True,
-                mmap=True,
-            )
-        except TypeError:
-            payload = torch.load(checkpoint_path, map_location="cpu")
-        except RuntimeError as exc:
-            if "mmap can only be used" not in str(exc):
-                raise
-            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        if isinstance(payload, dict) and isinstance(payload.get("model"), dict):
-            payload = payload["model"]
-        if not isinstance(payload, dict):
-            raise ValueError("checkpoint does not contain a model state dictionary")
+        payload = read_checkpoint_state(checkpoint_path)
         return {
             key.removeprefix("module.").replace(".base_layer.", "."): value
             for key, value in payload.items()
@@ -535,7 +521,7 @@ class IndexTTS2:
             loaded = self.preload_gpt_checkpoint(resolved)
         model = self._gpt_models[loaded]
         if model.accel_engine is not None:
-            model.accel_engine.reset_model_state()
+            model.accel_engine.reset_model_state(weights_changed=False)
         self.gpt = model
         self.gpt_path = loaded
         return loaded

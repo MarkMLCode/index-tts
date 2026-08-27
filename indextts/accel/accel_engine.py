@@ -526,12 +526,13 @@ class AccelInferenceEngine:
             [prompt_tokens + best_tokens], dtype=torch.long, device=device
         )
 
-    def reset_model_state(self) -> None:
+    def reset_model_state(self, *, weights_changed: bool = True) -> None:
         """Invalidate state tied to the currently loaded GPT checkpoint."""
         if self.current_sequences:
             raise RuntimeError("cannot reset accelerated model state during generation")
         self.kv_manager.reset()
-        self._lm_head_fp32 = None
+        if weights_changed:
+            self._lm_head_fp32 = None
 
     def _capture_cuda_graphs(self, tts_mel_embedding=None, tts_text_pos_embedding=None):
         print("Capturing CUDA graphs for decode optimization...")
@@ -556,21 +557,8 @@ class AccelInferenceEngine:
 
         use_tts = tts_mel_embedding is not None and tts_text_pos_embedding is not None
 
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-
-            slot_mapping[:bs] = torch.arange(bs, dtype=torch.int32, device="cuda")
-            context_lens[:bs] = bs + 1
-            block_tables[:bs, :] = 0
-
-            set_forward_context(
-                False,
-                slot_mapping=slot_mapping[:bs],
-                context_lens=context_lens[:bs],
-                block_tables=block_tables[:bs],
-            )
-
-            # warmup
+        def run_decode(bs):
+            # Warmup and capture must execute exactly the same tensor operations.
             if use_tts:
                 assert tts_mel_embedding is not None
                 assert tts_text_pos_embedding is not None
@@ -588,23 +576,23 @@ class AccelInferenceEngine:
                 ).last_hidden_state
             outputs[:bs] = out.squeeze(1) if out.dim() == 3 else out
 
+        for bs in reversed(self.graph_bs):
+            graph = torch.cuda.CUDAGraph()
+
+            slot_mapping[:bs] = torch.arange(bs, dtype=torch.int32, device="cuda")
+            context_lens[:bs] = bs + 1
+            block_tables[:bs, :] = 0
+
+            set_forward_context(
+                False,
+                slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs],
+                block_tables=block_tables[:bs],
+            )
+
+            run_decode(bs)
             with torch.cuda.graph(graph, self.graph_pool):
-                if use_tts:
-                    assert tts_mel_embedding is not None
-                    assert tts_text_pos_embedding is not None
-                    emb = tts_mel_embedding(input_ids[:bs])
-                    pos_clamped = torch.clamp(positions[:bs], min=0)
-                    pos_emb = tts_text_pos_embedding.emb(pos_clamped)
-                    inputs_embeds_buffer[:bs] = emb + pos_emb
-                    out = self.model(
-                        inputs_embeds=inputs_embeds_buffer[:bs].unsqueeze(1),
-                        return_dict=True,
-                    ).last_hidden_state
-                else:
-                    out = self.model(
-                        input_ids=input_ids[:bs].unsqueeze(1), return_dict=True
-                    ).last_hidden_state
-                outputs[:bs] = out.squeeze(1) if out.dim() == 3 else out
+                run_decode(bs)
 
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()

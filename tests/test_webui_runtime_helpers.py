@@ -16,14 +16,13 @@ import gradio as gr
 import numpy as np
 import torch
 
+from indextts.utils.seed import apply_seed, normalize_seed
 
 WEBUI_PATH = Path(__file__).resolve().parents[1] / "webui.py"
 HELPERS = {
     "_portable_model_path",
     "_save_last_gpt_checkpoint",
     "_read_last_gpt_checkpoint",
-    "_normalize_seed",
-    "_apply_seed",
     "_format_stream_chunk",
     "load_gpt_checkpoint",
     "gen_single",
@@ -47,6 +46,8 @@ def load_helpers(**overrides):
         "time": time,
         "gr": gr,
         "np": np,
+        "apply_seed": apply_seed,
+        "normalize_seed": normalize_seed,
     }
     namespace.update(overrides)
     exec(
@@ -98,11 +99,11 @@ class WebUIRuntimeHelperTests(unittest.TestCase):
 
     def test_seed_is_reproducible_and_random_mode_resolves(self):
         helpers = load_helpers()
-        helpers["_apply_seed"](1234)
+        helpers["apply_seed"](1234)
         first = torch.rand(8)
-        helpers["_apply_seed"](1234)
+        helpers["apply_seed"](1234)
         self.assertTrue(torch.equal(first, torch.rand(8)))
-        self.assertGreaterEqual(helpers["_normalize_seed"](-1), 0)
+        self.assertGreaterEqual(helpers["normalize_seed"](-1), 0)
 
     def test_stream_chunk_is_gradio_pcm(self):
         helpers = load_helpers()
@@ -199,12 +200,16 @@ class WebUIRuntimeHelperTests(unittest.TestCase):
         self.assertIsNone(normal[0][0])
         first_sample = fake_tts.samples[-1]
 
+        random.random()
+        np.random.rand(20)
+        torch.rand(20)
         list(helpers["gen_single"](*common, False, *advanced))
         self.assertTrue(torch.equal(first_sample, fake_tts.samples[-1]))
 
         streamed = list(helpers["gen_single"](*common, True, *advanced))
         self.assertEqual(len(streamed), 4)  # clear, two chunks, final WAV
         self.assertEqual(streamed[1][0][0], 22050)
+        self.assertTrue(torch.equal(first_sample, fake_tts.samples[-1]))
 
 
 if __name__ == "__main__":

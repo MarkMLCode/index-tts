@@ -2,7 +2,6 @@ import html
 import gc
 import json
 import os
-import random
 import sys
 import threading
 import time
@@ -101,6 +100,7 @@ IS_V25 = cmd_args.version == "2.5"
 import gradio as gr
 from indextts.utils.examples_downloader import ensure_examples_available
 from indextts.utils.presets import list_presets, save_preset, load_preset, delete_preset
+from indextts.utils.seed import apply_seed, normalize_seed
 from tools.i18n.i18n import I18nAuto
 
 if IS_V25:
@@ -916,28 +916,6 @@ def close_save_preset_modal():
     return gr.update(visible=False)
 
 
-def _normalize_seed(seed_value):
-    if seed_value is None or str(seed_value).strip() == "":
-        seed_value = -1
-    try:
-        seed = int(float(seed_value))
-    except (TypeError, ValueError):
-        raise ValueError("Seed must be an integer or -1 for a random result.") from None
-    if seed < 0:
-        return random.SystemRandom().randrange(0, 2**63 - 1)
-    return seed
-
-
-def _apply_seed(seed):
-    import torch
-
-    random.seed(seed % (2**32))
-    np.random.seed(seed % (2**32))
-    torch.manual_seed(seed % (2**63 - 1))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed % (2**63 - 1))
-
-
 def _format_stream_chunk(chunk, sampling_rate=22050):
     if chunk is None:
         return None
@@ -1019,7 +997,7 @@ def gen_single(emo_control_method,prompt, text,
     )
     if IS_V25:
         infer_kwargs["lang"] = lang_choice or "ZH"
-    seed = _normalize_seed(seed_value)
+    seed = normalize_seed(seed_value)
     print(f">> generation seed: {seed}")
 
     # Gradio closes every streaming output when this generator finishes. Initialize
@@ -1029,7 +1007,7 @@ def gen_single(emo_control_method,prompt, text,
     if streaming_enabled:
         infer_kwargs["stream_return"] = True
         with MODEL_LOCK:
-            _apply_seed(seed)
+            apply_seed(seed)
             chunks = tts.infer(**infer_kwargs)
             for chunk in chunks:
                 formatted = _format_stream_chunk(chunk)
@@ -1039,7 +1017,7 @@ def gen_single(emo_control_method,prompt, text,
         return
 
     with MODEL_LOCK:
-        _apply_seed(seed)
+        apply_seed(seed)
         output = tts.infer(**infer_kwargs)
     yield gr.skip(), gr.update(value=output, visible=True)
 
