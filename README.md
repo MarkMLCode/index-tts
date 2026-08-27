@@ -187,9 +187,13 @@ uv run webui.py --version 2 --model_dir ./checkpoints_2
 Open your browser and visit `http://127.0.0.1:7860` to see the demo.
 
 The WebUI can refresh and switch among GPT checkpoints in `checkpoints`,
-`models`, and `_trained` without reloading the shared audio models. It remembers
-the last successfully loaded checkpoint in the ignored local file
-`.webui_settings.json`. Advanced generation controls include a reproducible
+`models`, and `_trained` without reloading the shared audio models. **Load / Switch**
+replaces an uncached model in-place, while switching to a resident model only
+replaces the active GPT reference. Use **Preload Selected** to retain several
+models in VRAM and **Unload Inactive** to release them. It remembers the last
+successfully
+loaded checkpoint in the ignored local file `.webui_settings.json`. Advanced
+generation controls include a reproducible
 seed (`-1` chooses a fresh random seed), and **Realtime streaming playback**
 plays each completed segment while the full WAV continues generating.
 
@@ -218,35 +222,58 @@ For production deployment, see the [vLLM recipe for IndexTTS](https://recipes.vl
 
 ### 🌐 HTTP API
 
-`api.py` keeps one IndexTTS2.5 model in memory and serializes model loading and
-inference. Start it with:
+`api.py` keeps one shared IndexTTS2.5 speech stack plus any requested resident
+GPT checkpoints in memory, and serializes loading, switching, and inference.
+Start it with:
 
 ```bash
 uv run api.py --bind-addr 127.0.0.1 --port 9880
 ```
 
-Load the checkpoint from `config.yaml` (or add a singular `gpt_checkpoint`
-path to load a fine-tuned GPT checkpoint):
+Load one or more GPT checkpoints and choose the main one. When the list contains
+only one checkpoint, `main_gpt_checkpoint` may be omitted:
 
 ```bash
 curl -X POST http://127.0.0.1:9880/load_model \
   -H "Content-Type: application/json" \
-  -d '{"model_dir":"checkpoints","config":"checkpoints/config.yaml","use_bf16":true}'
+  -d '{"model_dir":"checkpoints","config":"checkpoints/config.yaml","use_bf16":true,"gpt_checkpoint_paths":["_trained/voice-a.pth","_trained/voice-b.pth"],"main_gpt_checkpoint":"_trained/voice-a.pth"}'
 ```
+
+Switch to a resident checkpoint without loading or copying its weights:
+
+```bash
+curl -X POST http://127.0.0.1:9880/switch_model \
+  -H "Content-Type: application/json" \
+  -d '{"gpt_checkpoint":"_trained/voice-b.pth"}'
+```
+
+`GET /models` reports the active and resident checkpoints. POST a checkpoint
+to `/unload_model` to release an inactive model. Calling `/load_model` again
+with the same runtime settings updates the exact resident set without
+reconstructing the shared speech stack.
 
 Generate audio from the loaded model:
 
 ```bash
 curl -X POST http://127.0.0.1:9880/generate \
   -H "Content-Type: application/json" \
-  -d '{"speaker":"examples/voice_01.wav","text":"Hello world","lang":"EN","media_type":"wav"}' \
+  -d '{"gpt_checkpoint":"_trained/voice-b.pth","speaker":"examples/voice_01.wav","text":"Hello world","lang":"EN","media_type":"wav"}' \
   --output gen.wav
 ```
 
 The server also provides the GPT-SoVITS-compatible `GET /tts` endpoint and
 supports `wav`, `raw`, `ogg`, and `aac` responses. AAC output requires the
-`ffmpeg` executable. A later `/load_model` call releases the current model
-before loading its replacement; `/generate` never switches checkpoints.
+`ffmpeg` executable. Each `/generate` request selects one of the resident GPT
+checkpoints atomically with inference, so concurrent requests cannot mix models.
+
+Resident models use the same precision and weights as single-model inference;
+no quantization or CPU offload is introduced. The non-GPT semantic, codec,
+S2Mel, CAMPPlus, BigVGAN, and emotion components are shared. With `use_accel`,
+cached GPTs also share their KV workspace and omit the redundant standard GPT
+transformer copy. Frozen GPT conditioning modules are interned only when their
+tensors are bit-identical. DeepSpeed does not support resident multi-model
+switching. The first generation from each accelerated checkpoint may capture
+its CUDA graph; later model switches are immediate.
 
 ### 📝 Python API
 
@@ -283,6 +310,20 @@ tts = IndexTTS2(cfg_path="checkpoints_2/config.yaml", model_dir="checkpoints_2",
 # IndexTTS2.5
 from indextts.infer_v2_5 import IndexTTS2
 tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_bf16=True)
+```
+
+To preload and hot-swap 2.5 GPT checkpoints from Python:
+
+```python
+tts = IndexTTS2(
+    cfg_path="checkpoints/config.yaml",
+    model_dir="checkpoints",
+    use_bf16=True,
+    gpt_checkpoint_path="_trained/voice-a.pth",
+    gpt_checkpoint_paths=["_trained/voice-a.pth", "_trained/voice-b.pth"],
+)
+tts.set_gpt_checkpoint("_trained/voice-b.pth")  # resident pointer swap
+tts.unload_gpt_checkpoint("_trained/voice-a.pth")  # active models cannot be unloaded
 ```
 
 #### 1. Voice cloning with a single reference audio

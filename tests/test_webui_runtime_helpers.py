@@ -25,6 +25,7 @@ HELPERS = {
     "_normalize_seed",
     "_apply_seed",
     "_format_stream_chunk",
+    "load_gpt_checkpoint",
     "gen_single",
 }
 
@@ -127,6 +128,47 @@ class WebUIRuntimeHelperTests(unittest.TestCase):
             )
             saved = json.loads(settings.read_text(encoding="utf-8"))
             self.assertEqual(saved["last_gpt_checkpoint"], "_trained/voice.pth")
+
+    def test_load_switch_replaces_an_uncached_single_model(self):
+        class ResidentRuntime:
+            def __init__(self, current):
+                self.loaded_gpt_checkpoints = (current,)
+                self.replaced = []
+                self.preloaded = []
+
+            def is_gpt_checkpoint_loaded(self, path):
+                return path in self.loaded_gpt_checkpoints
+
+            def replace_gpt_checkpoint(self, path):
+                self.replaced.append(path)
+                self.loaded_gpt_checkpoints = (path,)
+                return path
+
+            def preload_gpt_checkpoint(self, path):
+                self.preloaded.append(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = root / "base.pth"
+            selected = root / "voice.pth"
+            current.touch()
+            selected.touch()
+            runtime = ResidentRuntime(str(current.resolve()))
+            saved = []
+            helpers = load_helpers(
+                tts=runtime,
+                MODEL_LOCK=threading.RLock(),
+                CURRENT_GPT_PATH=str(current.resolve()),
+                cmd_args=types.SimpleNamespace(deepspeed=False),
+                IS_V25=True,
+            )
+            helpers["_save_last_gpt_checkpoint"] = saved.append
+
+            helpers["load_gpt_checkpoint"](selected)
+
+            self.assertEqual(runtime.replaced, [str(selected.resolve())])
+            self.assertEqual(runtime.preloaded, [])
+            self.assertEqual(saved, [str(selected.resolve())])
 
     def test_generation_supports_normal_and_streaming_outputs(self):
         fake_tts = FakeTTS()

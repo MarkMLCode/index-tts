@@ -28,6 +28,7 @@ class AccelInferenceEngine:
         block_size: int = 256,
         num_blocks: int = 128,
         use_cuda_graph: bool = True,
+        kv_manager: Optional[KVCacheManager] = None,
     ):
         """
         Args:
@@ -50,14 +51,35 @@ class AccelInferenceEngine:
             if hasattr(model, "config")
             else head_dim * num_heads
         )
-        self.kv_manager = KVCacheManager(
-            num_layers=num_layers,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            block_size=block_size,
-            num_blocks=num_blocks,
-            dtype=next(model.parameters()).dtype,
-        )
+        model_dtype = next(model.parameters()).dtype
+        if kv_manager is None:
+            kv_manager = KVCacheManager(
+                num_layers=num_layers,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                block_size=block_size,
+                num_blocks=num_blocks,
+                dtype=model_dtype,
+            )
+        else:
+            expected = (num_layers, num_heads, head_dim, block_size, num_blocks)
+            actual = (
+                kv_manager.num_layers,
+                kv_manager.num_heads,
+                kv_manager.head_dim,
+                kv_manager.block_size,
+                kv_manager.num_blocks,
+            )
+            if actual != expected:
+                raise ValueError(
+                    f"shared KV cache shape is incompatible: expected {expected}, got {actual}"
+                )
+            if kv_manager.dtype != model_dtype:
+                raise ValueError(
+                    "shared KV cache dtype is incompatible: "
+                    f"expected {model_dtype}, got {kv_manager.dtype}"
+                )
+        self.kv_manager = kv_manager
         self.kv_manager.wire_kv_cache_to_model(model)
         # Sampling is sensitive to logit rounding. Lazily retain an fp32 copy
         # of the final norm/head when accelerated inference runs in fp16/bf16.

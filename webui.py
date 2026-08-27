@@ -1,4 +1,5 @@
 import html
+import gc
 import json
 import os
 import random
@@ -277,7 +278,11 @@ def format_model_choices(paths):
 def model_status_text():
     label = _model_label(CURRENT_GPT_PATH)
     suffix = " Dynamic switching is unavailable with DeepSpeed." if cmd_args.deepspeed else ""
-    return f"✅ Loaded GPT model: `{label}`.{suffix}"
+    loaded = getattr(tts, "loaded_gpt_checkpoints", (CURRENT_GPT_PATH,))
+    cached = ", ".join(f"`{_model_label(path)}`" for path in loaded)
+    return (
+        f"✅ Active GPT model: `{label}`. Resident models ({len(loaded)}): {cached}.{suffix}"
+    )
 
 
 def _read_checkpoint_state(checkpoint_path):
@@ -316,7 +321,7 @@ def _clear_accel_prefix_cache(engine):
 
 
 def load_gpt_checkpoint(checkpoint_path):
-    """Replace only GPT weights, retaining the shared 2.5 inference components."""
+    """Cache and activate GPT weights while retaining shared inference components."""
     global CURRENT_GPT_PATH
     if cmd_args.deepspeed:
         raise RuntimeError(
@@ -329,6 +334,21 @@ def load_gpt_checkpoint(checkpoint_path):
         raise FileNotFoundError(f"GPT checkpoint not found: {resolved}")
     if os.path.normcase(resolved) == os.path.normcase(CURRENT_GPT_PATH):
         _save_last_gpt_checkpoint(resolved)
+        return
+
+    if IS_V25:
+        with MODEL_LOCK:
+            if tts.is_gpt_checkpoint_loaded(resolved):
+                selected = tts.set_gpt_checkpoint(resolved)
+            elif len(tts.loaded_gpt_checkpoints) == 1:
+                selected = tts.replace_gpt_checkpoint(resolved)
+            else:
+                previous = CURRENT_GPT_PATH
+                tts.preload_gpt_checkpoint(resolved)
+                selected = tts.set_gpt_checkpoint(resolved)
+                tts.unload_gpt_checkpoint(previous)
+            CURRENT_GPT_PATH = selected
+            _save_last_gpt_checkpoint(selected)
         return
 
     state = _read_checkpoint_state(resolved)
@@ -373,6 +393,36 @@ def load_gpt_checkpoint(checkpoint_path):
         _save_last_gpt_checkpoint(resolved)
 
 
+def preload_gpt_checkpoints(checkpoint_paths):
+    """Load several 2.5 GPT models without changing the active model."""
+    if not IS_V25:
+        raise RuntimeError("resident multi-model caching requires IndexTTS-2.5")
+    if cmd_args.deepspeed:
+        raise RuntimeError("resident multi-model caching is not supported with DeepSpeed")
+    with MODEL_LOCK:
+        return tts.preload_gpt_checkpoints(checkpoint_paths)
+
+
+def unload_inactive_gpt_checkpoints():
+    """Release every cached model except the active checkpoint."""
+    if not IS_V25:
+        return ()
+    with MODEL_LOCK:
+        removed = []
+        for path in tuple(tts.loaded_gpt_checkpoints):
+            if os.path.normcase(path) != os.path.normcase(CURRENT_GPT_PATH):
+                removed.append(tts.unload_gpt_checkpoint(path))
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except RuntimeError:
+            pass
+        return tuple(removed)
+
+
 def restore_last_gpt_checkpoint():
     saved = _read_last_gpt_checkpoint()
     if not saved or os.path.normcase(saved) == os.path.normcase(CURRENT_GPT_PATH):
@@ -381,7 +431,10 @@ def restore_last_gpt_checkpoint():
         print(f">> Saved GPT checkpoint is no longer available: {saved}", file=sys.stderr)
         return
     try:
+        previous = CURRENT_GPT_PATH
         load_gpt_checkpoint(saved)
+        if IS_V25 and os.path.normcase(previous) != os.path.normcase(saved):
+            unload_inactive_gpt_checkpoints()
         print(f">> Restored last WebUI GPT model: {saved}")
     except Exception as exc:
         print(f">> Could not restore saved GPT checkpoint {saved}: {exc}", file=sys.stderr)
@@ -1066,13 +1119,32 @@ with gr.Blocks(
                 choices=model_labels,
                 value=selected_model_label,
                 label="GPT checkpoint (.pth)",
-                info="Scans checkpoints, models, and _trained. Only one GPT model is active at a time.",
+                info=(
+                    "Load / Switch replaces an uncached active model in-place. "
+                    "Use Preload Selected to retain multiple models in VRAM."
+                ),
                 interactive=not cmd_args.deepspeed,
                 scale=4,
             )
             refresh_models_button = gr.Button("Refresh", variant="secondary", scale=1)
             load_model_button = gr.Button(
-                "Load Model", variant="primary", interactive=not cmd_args.deepspeed, scale=1
+                "Load / Switch", variant="primary", interactive=not cmd_args.deepspeed, scale=1
+            )
+        with gr.Row(visible=IS_V25):
+            preload_model_dropdown = gr.Dropdown(
+                choices=model_labels,
+                value=[],
+                label="Preload models into VRAM",
+                info="Select multiple checkpoints to load now; the active model is unchanged.",
+                multiselect=True,
+                interactive=not cmd_args.deepspeed,
+                scale=4,
+            )
+            preload_models_button = gr.Button(
+                "Preload Selected", variant="secondary", interactive=not cmd_args.deepspeed, scale=1
+            )
+            unload_models_button = gr.Button(
+                "Unload Inactive", variant="secondary", interactive=not cmd_args.deepspeed, scale=1
             )
 
     def refresh_model_list():
@@ -1080,6 +1152,7 @@ with gr.Blocks(
         labels, mapping, selected = format_model_choices(paths)
         return (
             gr.update(choices=labels, value=selected),
+            gr.update(choices=labels, value=[]),
             mapping,
             model_status_text(),
         )
@@ -1104,14 +1177,59 @@ with gr.Blocks(
         gr.Info(f"Loaded GPT model: {_model_label(path)}")
         return model_status_text()
 
+    def handle_model_preload(
+        selected_labels,
+        mapping,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        paths = [(mapping or {}).get(label) for label in (selected_labels or [])]
+        paths = [path for path in paths if path]
+        if not paths:
+            gr.Warning("Select at least one GPT checkpoint to preload.")
+            return model_status_text()
+        try:
+            for index, path in enumerate(paths, 1):
+                progress((index - 1) / len(paths), desc=f"Loading {_model_label(path)}")
+                preload_gpt_checkpoints([path])
+        except Exception as exc:
+            print(f">> Failed to preload GPT checkpoint: {exc}", file=sys.stderr)
+            gr.Warning(f"Failed to preload GPT checkpoint: {exc}")
+            return model_status_text()
+        progress(1.0, desc="GPT models preloaded")
+        gr.Info(f"Preloaded {len(paths)} GPT model(s).")
+        return model_status_text()
+
+    def handle_unload_inactive_models():
+        try:
+            removed = unload_inactive_gpt_checkpoints()
+        except Exception as exc:
+            gr.Warning(f"Failed to unload GPT models: {exc}")
+            return model_status_text()
+        gr.Info(f"Unloaded {len(removed)} inactive GPT model(s).")
+        return model_status_text()
+
     refresh_models_button.click(
         refresh_model_list,
         inputs=[],
-        outputs=[model_dropdown, model_map_state, model_status],
+        outputs=[model_dropdown, preload_model_dropdown, model_map_state, model_status],
     )
     load_model_button.click(
         handle_model_load,
         inputs=[model_dropdown, model_map_state],
+        outputs=[model_status],
+        concurrency_limit=1,
+        concurrency_id="model-runtime",
+    )
+    preload_models_button.click(
+        handle_model_preload,
+        inputs=[preload_model_dropdown, model_map_state],
+        outputs=[model_status],
+        concurrency_limit=1,
+        concurrency_id="model-runtime",
+    )
+    unload_models_button.click(
+        handle_unload_inactive_models,
+        inputs=[],
         outputs=[model_status],
         concurrency_limit=1,
         concurrency_id="model-runtime",

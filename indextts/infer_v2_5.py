@@ -1,5 +1,6 @@
 import os
 from subprocess import CalledProcessError
+from typing import Iterable
 
 os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
 import json
@@ -74,10 +75,21 @@ def apply_pronunciation_annotations(text: str) -> str:
 
 
 class IndexTTS2:
+    # The in-repo 2.5 trainer freezes these modules.  Independently produced
+    # checkpoints may not, so they are shared only after a bit-exact comparison.
+    _SHAREABLE_GPT_MODULES = (
+        "spk_emb_proj",
+        "emo_conditioning_encoder",
+        "emo_perceiver_encoder",
+        "emovec_layer",
+        "emo_layer",
+    )
+
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_bf16=False, device=None,
             use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False, use_qwen_emo=False,
             gpt_checkpoint_path=None,
+            gpt_checkpoint_paths=None,
     ):
         """
         Args:
@@ -94,6 +106,9 @@ class IndexTTS2:
                 guidance when this is disabled will raise a RuntimeError.
             gpt_checkpoint_path (str | None): optional GPT checkpoint override. When omitted,
                 the checkpoint named by ``config.yaml`` is loaded.
+            gpt_checkpoint_paths (iterable[str] | None): additional GPT checkpoints to
+                preload. They share the non-GPT speech stack and can be selected with
+                ``set_gpt_checkpoint`` without copying weights during the switch.
         """
         if device is not None:
             self.device = device
@@ -123,6 +138,7 @@ class IndexTTS2:
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
         self.use_accel = use_accel
         self.use_torch_compile = use_torch_compile
+        self.use_deepspeed = use_deepspeed
 
         # Detect low-VRAM GPUs (< 10 GB) to enable automatic text chunking
         self.low_vram = False
@@ -139,20 +155,11 @@ class IndexTTS2:
             self.qwen_emo = None
             print(">> QwenEmotion not loaded (use_qwen_emo=False)")
 
-        self.gpt = UnifiedVoice(**self.cfg.gpt, use_accel=self.use_accel, spk_cond_mode="campplus")
         if gpt_checkpoint_path is None:
             self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
         else:
             self.gpt_path = os.path.abspath(os.path.expanduser(gpt_checkpoint_path))
-            if not os.path.isfile(self.gpt_path):
-                raise FileNotFoundError(f"GPT checkpoint not found: {self.gpt_path}")
-        load_checkpoint(self.gpt, self.gpt_path)
-        self.gpt = self.gpt.to(self.device)
-        if self.use_bf16:
-            self.gpt.eval().bfloat16()
-        else:
-            self.gpt.eval()
-        print(">> GPT weights restored from:", self.gpt_path)
+        self.gpt_path = self._resolve_gpt_checkpoint(self.gpt_path)
 
         if use_deepspeed:
             try:
@@ -160,13 +167,15 @@ class IndexTTS2:
             except (ImportError, OSError, CalledProcessError) as e:
                 use_deepspeed = False
                 print(f">> Failed to load DeepSpeed. Falling back to normal inference. Error: {e}")
+        self.use_deepspeed = use_deepspeed
+        self._gpt_models = {}
+        self._shared_accel_kv_manager = None
+        self.gpt = self._build_gpt_model(self.gpt_path)
+        self._gpt_models[self.gpt_path] = self.gpt
 
-        self.gpt.post_init_gpt2_config(
-            use_deepspeed=use_deepspeed,
-            kv_cache=True,
-            half=self.use_bf16,
-            accel_dtype=self.dtype,
-        )
+        requested_gpt_paths = list(gpt_checkpoint_paths or ())
+        if requested_gpt_paths:
+            self.preload_gpt_checkpoints(requested_gpt_paths)
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
@@ -290,6 +299,236 @@ class IndexTTS2:
         # 进度引用显示（可选）
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
+
+    @staticmethod
+    def _canonical_gpt_checkpoint(checkpoint_path):
+        return os.path.abspath(os.path.expanduser(os.fspath(checkpoint_path)))
+
+    @classmethod
+    def _resolve_gpt_checkpoint(cls, checkpoint_path):
+        resolved = cls._canonical_gpt_checkpoint(checkpoint_path)
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f"GPT checkpoint not found: {resolved}")
+        return resolved
+
+    def _loaded_gpt_path(self, checkpoint_path):
+        wanted = os.path.normcase(self._canonical_gpt_checkpoint(checkpoint_path))
+        return next(
+            (path for path in self._gpt_models if os.path.normcase(path) == wanted),
+            None,
+        )
+
+    def _build_gpt_model(self, checkpoint_path):
+        model = UnifiedVoice(
+            **self.cfg.gpt,
+            use_accel=self.use_accel,
+            spk_cond_mode="campplus",
+        )
+        load_checkpoint(model, checkpoint_path)
+        model = model.to(self.device)
+        if self.use_bf16:
+            model.eval().bfloat16()
+        else:
+            model.eval()
+        print(">> GPT weights restored from:", checkpoint_path)
+
+        model.post_init_gpt2_config(
+            use_deepspeed=self.use_deepspeed,
+            kv_cache=True,
+            half=self.use_bf16,
+            accel_dtype=self.dtype,
+            accel_kv_manager=self._shared_accel_kv_manager,
+        )
+        if model.accel_engine is not None:
+            model._standard_gpt_state_shapes = {
+                key: tuple(value.shape)
+                for key, value in model.gpt.state_dict().items()
+                if key != "wte.weight"
+            }
+            if self._shared_accel_kv_manager is None:
+                self._shared_accel_kv_manager = model.accel_engine.kv_manager
+            model.release_standard_transformer_for_accel()
+        self._share_identical_gpt_modules(model)
+        return model
+
+    def _share_identical_gpt_modules(self, model):
+        """Intern bit-identical frozen conditioning modules across GPT models."""
+        if not self._gpt_models:
+            return ()
+        reference = next(iter(self._gpt_models.values()))
+        shared = []
+        for name in self._SHAREABLE_GPT_MODULES:
+            candidate_module = getattr(model, name, None)
+            reference_module = getattr(reference, name, None)
+            if candidate_module is None or reference_module is None:
+                continue
+            candidate_state = candidate_module.state_dict()
+            reference_state = reference_module.state_dict()
+            if candidate_state.keys() != reference_state.keys():
+                continue
+            if all(
+                candidate_state[key].shape == reference_state[key].shape
+                and candidate_state[key].dtype == reference_state[key].dtype
+                and torch.equal(candidate_state[key], reference_state[key])
+                for key in candidate_state
+            ):
+                setattr(model, name, reference_module)
+                shared.append(name)
+        if shared:
+            print(">> Shared bit-identical GPT modules:", ", ".join(shared))
+        return tuple(shared)
+
+    @property
+    def loaded_gpt_checkpoints(self):
+        """Return all resident GPT checkpoints in load order."""
+        return tuple(self._gpt_models)
+
+    def preload_gpt_checkpoint(self, checkpoint_path):
+        """Load one GPT checkpoint into the resident cache without activating it."""
+        resolved = self._resolve_gpt_checkpoint(checkpoint_path)
+        loaded = self._loaded_gpt_path(resolved)
+        if loaded is not None:
+            return loaded
+        if self.use_deepspeed:
+            raise RuntimeError("multiple resident GPT models are not supported with DeepSpeed")
+        self._gpt_models[resolved] = self._build_gpt_model(resolved)
+        return resolved
+
+    def preload_gpt_checkpoints(self, checkpoint_paths: Iterable[str]):
+        """Preload checkpoints and return their canonical paths."""
+        return tuple(self.preload_gpt_checkpoint(path) for path in checkpoint_paths)
+
+    def is_gpt_checkpoint_loaded(self, checkpoint_path):
+        """Return whether a checkpoint is already resident without reading it."""
+        return self._loaded_gpt_path(checkpoint_path) is not None
+
+    @staticmethod
+    def _checkpoint_state(checkpoint_path):
+        try:
+            payload = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+        except TypeError:
+            payload = torch.load(checkpoint_path, map_location="cpu")
+        except RuntimeError as exc:
+            if "mmap can only be used" not in str(exc):
+                raise
+            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if isinstance(payload, dict) and isinstance(payload.get("model"), dict):
+            payload = payload["model"]
+        if not isinstance(payload, dict):
+            raise ValueError("checkpoint does not contain a model state dictionary")
+        return {
+            key.removeprefix("module.").replace(".base_layer.", "."): value
+            for key, value in payload.items()
+            if hasattr(value, "shape")
+            and not key.startswith("inference_model.")
+            and ".lora_" not in key
+            and key.removeprefix("module.") != "gpt.wte.weight"
+        }
+
+    @staticmethod
+    def _canonical_model_state(state):
+        return {
+            key: value
+            for key, value in state.items()
+            if not key.startswith(("inference_model.", "ds_engine."))
+            and "accel_engine" not in key
+            and key != "gpt.wte.weight"
+        }
+
+    @staticmethod
+    def _validate_checkpoint_subset(required, candidate, description):
+        missing = sorted(set(required) - set(candidate))
+        if missing:
+            coverage = (len(required) - len(missing)) / max(len(required), 1)
+            raise ValueError(
+                f"checkpoint only matches {coverage:.1%} of the {description}; "
+                f"missing examples: {missing[:5]}"
+            )
+        shape_errors = [
+            f"{key}: expected {tuple(required[key])}, got {tuple(candidate[key].shape)}"
+            for key in required
+            if tuple(candidate[key].shape) != tuple(required[key])
+        ]
+        if shape_errors:
+            raise ValueError(
+                f"checkpoint tensor shapes are incompatible: {'; '.join(shape_errors[:5])}"
+            )
+
+    def replace_gpt_checkpoint(self, checkpoint_path):
+        """Replace the sole resident GPT in-place, preserving initialized engines."""
+        if self.use_deepspeed:
+            raise RuntimeError("live GPT replacement is not supported with DeepSpeed")
+        if len(self._gpt_models) != 1:
+            raise RuntimeError("in-place GPT replacement requires exactly one resident model")
+        resolved = self._resolve_gpt_checkpoint(checkpoint_path)
+        loaded = self._loaded_gpt_path(resolved)
+        if loaded is not None:
+            return self.set_gpt_checkpoint(loaded)
+
+        model = self.gpt
+        candidate = self._checkpoint_state(resolved)
+        required_state = self._canonical_model_state(model.state_dict())
+        required_shapes = {key: tuple(value.shape) for key, value in required_state.items()}
+        self._validate_checkpoint_subset(required_shapes, candidate, "IndexTTS-2.5 GPT")
+
+        if model.accel_engine is not None:
+            core_shapes = getattr(model, "_standard_gpt_state_shapes", None)
+            if not core_shapes:
+                raise RuntimeError("accelerated GPT shape metadata is unavailable")
+            core_state = {
+                key.removeprefix("gpt."): value
+                for key, value in candidate.items()
+                if key.startswith("gpt.") and key != "gpt.wte.weight"
+            }
+            self._validate_checkpoint_subset(core_shapes, core_state, "GPT transformer")
+        else:
+            core_state = None
+
+        model.load_state_dict(
+            {key: candidate[key] for key in required_state},
+            strict=False,
+        )
+        if core_state is not None:
+            model.accel_engine.model.load_state_dict(core_state, strict=False)
+            model.accel_engine.reset_model_state()
+        model.eval()
+
+        old_path = next(iter(self._gpt_models))
+        del self._gpt_models[old_path]
+        self._gpt_models[resolved] = model
+        self.gpt_path = resolved
+        return resolved
+
+    def set_gpt_checkpoint(self, checkpoint_path, load_if_missing=False):
+        """Activate a resident checkpoint; the hot path only swaps a reference."""
+        resolved = self._canonical_gpt_checkpoint(checkpoint_path)
+        loaded = self._loaded_gpt_path(resolved)
+        if loaded is None:
+            if not load_if_missing:
+                raise ValueError(f"GPT checkpoint is not loaded: {resolved}")
+            loaded = self.preload_gpt_checkpoint(resolved)
+        model = self._gpt_models[loaded]
+        if model.accel_engine is not None:
+            model.accel_engine.reset_model_state()
+        self.gpt = model
+        self.gpt_path = loaded
+        return loaded
+
+    def unload_gpt_checkpoint(self, checkpoint_path):
+        """Release an inactive cached GPT model and return its canonical path."""
+        resolved = self._canonical_gpt_checkpoint(checkpoint_path)
+        loaded = self._loaded_gpt_path(resolved)
+        if loaded is None:
+            raise ValueError(f"GPT checkpoint is not loaded: {resolved}")
+        if os.path.normcase(loaded) == os.path.normcase(self.gpt_path):
+            raise ValueError("cannot unload the active GPT checkpoint")
+        del self._gpt_models[loaded]
+        return loaded
 
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):

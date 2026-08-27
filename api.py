@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FastAPI server for persistent, single-model IndexTTS 2.5 inference."""
+"""FastAPI server for persistent, multi-model IndexTTS 2.5 inference."""
 
 from __future__ import annotations
 
@@ -77,7 +77,8 @@ def load_model(
     *,
     config: str = "checkpoints/config.yaml",
     model_dir: str = "checkpoints",
-    gpt_checkpoint: Optional[str] = None,
+    gpt_checkpoint_paths: List[str],
+    main_gpt_checkpoint: Optional[str] = None,
     device: Optional[str] = None,
     use_bf16: bool = False,
     use_cuda_kernel: Optional[bool] = None,
@@ -86,18 +87,36 @@ def load_model(
     use_torch_compile: bool = False,
     use_qwen_emo: bool = False,
 ) -> str:
-    """Load exactly one IndexTTS 2.5 model and return its GPT path."""
+    """Load the requested resident GPT set and activate its main checkpoint."""
     config_path = _resolve_existing_file(config, "config file")
     model_dir_path = _resolve_existing_dir(model_dir, "model directory")
-    gpt_path = (
-        _resolve_existing_file(gpt_checkpoint, "GPT checkpoint")
-        if gpt_checkpoint is not None
-        else None
-    )
+    requested_gpt_paths: List[str] = []
+    requested_keys = set()
+    for checkpoint in gpt_checkpoint_paths:
+        resolved = _resolve_existing_file(checkpoint, "GPT checkpoint")
+        key = os.path.normcase(resolved)
+        if key not in requested_keys:
+            requested_gpt_paths.append(resolved)
+            requested_keys.add(key)
+    if not requested_gpt_paths:
+        raise ValueError("gpt_checkpoint_paths must contain at least one checkpoint")
+    if main_gpt_checkpoint is None:
+        if len(requested_gpt_paths) != 1:
+            raise ValueError(
+                "main_gpt_checkpoint is required when loading multiple GPT checkpoints"
+            )
+        main_gpt_path = requested_gpt_paths[0]
+    else:
+        resolved_main = _resolve_existing_file(main_gpt_checkpoint, "main GPT checkpoint")
+        main_key = os.path.normcase(resolved_main)
+        if main_key not in requested_keys:
+            raise ValueError("main_gpt_checkpoint must be included in gpt_checkpoint_paths")
+        main_gpt_path = next(
+            path for path in requested_gpt_paths if os.path.normcase(path) == main_key
+        )
     model_spec = (
         config_path,
         model_dir_path,
-        gpt_path,
         device,
         use_bf16,
         use_cuda_kernel,
@@ -111,10 +130,16 @@ def load_model(
         global CURRENT_ENGINE, CURRENT_MODEL_SPEC, CURRENT_GPT_PATH
 
         if CURRENT_ENGINE is not None and CURRENT_MODEL_SPEC == model_spec:
-            return cast(str, CURRENT_GPT_PATH)
+            CURRENT_ENGINE.preload_gpt_checkpoints(requested_gpt_paths)
+            CURRENT_ENGINE.set_gpt_checkpoint(main_gpt_path)
+            for loaded_path in tuple(CURRENT_ENGINE.loaded_gpt_checkpoints):
+                if os.path.normcase(loaded_path) not in requested_keys:
+                    CURRENT_ENGINE.unload_gpt_checkpoint(loaded_path)
+            CURRENT_GPT_PATH = str(Path(CURRENT_ENGINE.gpt_path).resolve())
+            return CURRENT_GPT_PATH
 
-        # The old engine must be released first because two full model instances
-        # generally do not fit in GPU memory at the same time.
+        # Runtime-setting changes require rebuilding the shared non-GPT stack.
+        # GPT-only changes take the cache path above instead.
         _release_engine_locked()
 
         from indextts.infer_v2_5 import IndexTTS2
@@ -122,7 +147,8 @@ def load_model(
         engine = IndexTTS2(
             cfg_path=config_path,
             model_dir=model_dir_path,
-            gpt_checkpoint_path=gpt_path,
+            gpt_checkpoint_path=main_gpt_path,
+            gpt_checkpoint_paths=requested_gpt_paths,
             device=device,
             use_bf16=use_bf16,
             use_cuda_kernel=use_cuda_kernel,
@@ -135,6 +161,44 @@ def load_model(
         CURRENT_MODEL_SPEC = model_spec
         CURRENT_GPT_PATH = str(Path(engine.gpt_path).resolve())
         return CURRENT_GPT_PATH
+
+
+def switch_model(gpt_checkpoint: str) -> str:
+    """Switch to an already resident GPT checkpoint without loading weights."""
+    resolved = str(Path(gpt_checkpoint).expanduser().resolve())
+    with MODEL_LOCK:
+        global CURRENT_GPT_PATH
+        engine = get_engine()
+        CURRENT_GPT_PATH = engine.set_gpt_checkpoint(resolved, load_if_missing=False)
+        return CURRENT_GPT_PATH
+
+
+def unload_model(gpt_checkpoint: str) -> str:
+    """Release one inactive GPT checkpoint from the resident cache."""
+    resolved = str(Path(gpt_checkpoint).expanduser().resolve())
+    with MODEL_LOCK:
+        engine = get_engine()
+        unloaded = engine.unload_gpt_checkpoint(resolved)
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.empty_cache()
+        except (ImportError, RuntimeError):
+            LOGGER.debug("Unable to empty the accelerator cache", exc_info=True)
+        return unloaded
+
+
+def model_status() -> Dict[str, Any]:
+    with MODEL_LOCK:
+        engine = get_engine()
+        return {
+            "active_gpt_checkpoint": str(Path(engine.gpt_path).resolve()),
+            "loaded_gpt_checkpoints": list(engine.loaded_gpt_checkpoints),
+        }
 
 
 def validate_emo_vector(emo_vector: Optional[List[float]]) -> Optional[List[float]]:
@@ -178,6 +242,7 @@ def build_generation_kwargs(
 
 def generate_audio(
     *,
+    gpt_checkpoint: Optional[str] = None,
     speaker: str,
     text: str,
     lang: str = "ZH",
@@ -225,7 +290,14 @@ def generate_audio(
     )
 
     with MODEL_LOCK:
-        result = get_engine().infer(
+        global CURRENT_GPT_PATH
+        engine = get_engine()
+        if gpt_checkpoint is not None:
+            selected = str(Path(gpt_checkpoint).expanduser().resolve())
+            CURRENT_GPT_PATH = engine.set_gpt_checkpoint(
+                selected, load_if_missing=False
+            )
+        result = engine.infer(
             spk_audio_prompt=speaker,
             text=text,
             output_path=None,
@@ -304,7 +376,8 @@ class APIRequest(BaseModel):
 
 
 class LoadModelRequest(APIRequest):
-    gpt_checkpoint: Optional[str] = None
+    gpt_checkpoint_paths: List[str]
+    main_gpt_checkpoint: Optional[str] = None
     config: str = "checkpoints/config.yaml"
     model_dir: str = "checkpoints"
     device: Optional[str] = None
@@ -316,7 +389,12 @@ class LoadModelRequest(APIRequest):
     use_qwen_emo: bool = False
 
 
+class GPTCheckpointRequest(APIRequest):
+    gpt_checkpoint: str
+
+
 class GenerateRequest(APIRequest):
+    gpt_checkpoint: str
     speaker: str
     text: str
     lang: str = "ZH"
@@ -356,6 +434,34 @@ def load_model_endpoint(request: LoadModelRequest):
         LOGGER.exception("Model loading failed")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"message": "success", "gpt_checkpoint": gpt_path}
+
+
+@APP.post("/switch_model")
+def switch_model_endpoint(request: GPTCheckpointRequest):
+    try:
+        gpt_path = switch_model(request.gpt_checkpoint)
+    except Exception as exc:
+        LOGGER.exception("Model switch failed")
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": "success", "gpt_checkpoint": gpt_path}
+
+
+@APP.post("/unload_model")
+def unload_model_endpoint(request: GPTCheckpointRequest):
+    try:
+        gpt_path = unload_model(request.gpt_checkpoint)
+    except Exception as exc:
+        LOGGER.exception("Model unload failed")
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": "success", "gpt_checkpoint": gpt_path}
+
+
+@APP.get("/models")
+def model_status_endpoint():
+    try:
+        return model_status()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @APP.post("/generate")
@@ -424,7 +530,10 @@ def tts_get_endpoint(
         raise HTTPException(status_code=400, detail="speed_factor must be greater than zero")
 
     duration_factor = max(0.5, min(2.0, 1.0 / speed_factor))
+    with MODEL_LOCK:
+        active_gpt_checkpoint = str(Path(get_engine().gpt_path).resolve())
     request = GenerateRequest(
+        gpt_checkpoint=active_gpt_checkpoint,
         speaker=ref_audio_path,
         text=text,
         lang=text_lang or "ZH",

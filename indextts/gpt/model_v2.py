@@ -420,7 +420,12 @@ class UnifiedVoice(nn.Module):
         self.accel_engine = None  # Will be initialized in post_init_gpt2_config
 
     def post_init_gpt2_config(
-        self, use_deepspeed=False, kv_cache=False, half=False, accel_dtype=None
+        self,
+        use_deepspeed=False,
+        kv_cache=False,
+        half=False,
+        accel_dtype=None,
+        accel_kv_manager=None,
     ):
         seq_length = self.max_mel_tokens + self.max_text_tokens + 2
         gpt_config = GPT2Config(
@@ -462,6 +467,7 @@ class UnifiedVoice(nn.Module):
                 block_size=256,
                 num_blocks=16,  # Reduce to save memory (16*256 = 4096 tokens capacity)
                 use_cuda_graph=True,
+                kv_manager=accel_kv_manager,
             )
             print("acceleration engine initialized")
         self.inference_model = GPT2InferenceModel(
@@ -492,6 +498,23 @@ class UnifiedVoice(nn.Module):
 
         # self.inference_model = PrunedGPT2InferenceModel(gpt_config, self.gpt, self.mel_pos_embedding, self.mel_embedding, self.final_norm, self.mel_head)
         self.gpt.wte = self.mel_embedding
+
+    def release_standard_transformer_for_accel(self):
+        """Drop the redundant Transformers GPT copy after accel initialization.
+
+        IndexTTS2.5 always requests one autoregressive sequence, so accelerated
+        inference uses ``accel_engine.model``.  Keeping the standard transformer
+        as well would duplicate the largest portion of every cached GPT model.
+        The embedding, conditioning, normalization and output-head modules stay
+        resident and remain checkpoint-specific.
+        """
+        if self.accel_engine is None:
+            return False
+        if self.inference_model is None:
+            raise RuntimeError("GPT inference model has not been initialized")
+        self.inference_model.transformer = None
+        self.gpt = None
+        return True
 
     def build_aligned_inputs_and_targets(self, input, start_token, stop_token):
         inp = F.pad(input, (1, 0), value=start_token)
