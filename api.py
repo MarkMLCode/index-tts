@@ -4,15 +4,20 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import gc
 import logging
 import os
 import subprocess
 import threading
+import time
+from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, cast
+
+API_IMPORT_STARTED = time.perf_counter()
+
+from indextts.runtime_logging import configure_run_logging, timed_stage
 
 import numpy as np
 import soundfile as sf
@@ -23,7 +28,21 @@ from pydantic import BaseModel, ConfigDict
 
 
 LOGGER = logging.getLogger(__name__)
-APP = FastAPI(title="IndexTTS 2.5 API")
+STARTUP_LOGGER = logging.getLogger("indextts.startup")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    configure_run_logging()
+    STARTUP_LOGGER.info(
+        "API application startup reached | elapsed_since_api_import=%.3fs; "
+        "model initialization is measured separately when /load_model is called",
+        time.perf_counter() - API_IMPORT_STARTED,
+    )
+    yield
+
+
+APP = FastAPI(title="IndexTTS 2.5 API", lifespan=lifespan)
 MODEL_LOCK = threading.RLock()
 SUPPORTED_MEDIA_TYPES = {"wav", "raw", "ogg", "aac"}
 
@@ -73,6 +92,7 @@ def get_engine() -> Any:
     return CURRENT_ENGINE
 
 
+@timed_stage("load_model total (including validation and lock wait)")
 def load_model(
     *,
     config: str = "checkpoints/config.yaml",
@@ -126,23 +146,35 @@ def load_model(
         use_qwen_emo,
     )
 
+    STARTUP_LOGGER.info(
+        "Loading %d resident GPT checkpoint(s); main=%s; device=%s; "
+        "bf16=%s; accel=%s; cuda_kernel=%s; torch_compile=%s; deepspeed=%s; qwen_emo=%s",
+        len(requested_gpt_paths), main_gpt_path, device or "auto",
+        use_bf16, use_accel, use_cuda_kernel, use_torch_compile, use_deepspeed, use_qwen_emo,
+    )
+    lock_started = time.perf_counter()
     with MODEL_LOCK:
         global CURRENT_ENGINE, CURRENT_MODEL_SPEC, CURRENT_GPT_PATH
+        STARTUP_LOGGER.info("Model lock acquired | wait=%.3fs", time.perf_counter() - lock_started)
 
         if CURRENT_ENGINE is not None and CURRENT_MODEL_SPEC == model_spec:
-            CURRENT_ENGINE.preload_gpt_checkpoints(requested_gpt_paths)
-            CURRENT_ENGINE.set_gpt_checkpoint(main_gpt_path)
-            for loaded_path in tuple(CURRENT_ENGINE.loaded_gpt_checkpoints):
-                if os.path.normcase(loaded_path) not in requested_keys:
-                    CURRENT_ENGINE.unload_gpt_checkpoint(loaded_path)
+            with timed_stage("Update resident GPT set (reuse shared speech stack)"):
+                CURRENT_ENGINE.preload_gpt_checkpoints(requested_gpt_paths)
+                CURRENT_ENGINE.set_gpt_checkpoint(main_gpt_path)
+                for loaded_path in tuple(CURRENT_ENGINE.loaded_gpt_checkpoints):
+                    if os.path.normcase(loaded_path) not in requested_keys:
+                        CURRENT_ENGINE.unload_gpt_checkpoint(loaded_path)
             CURRENT_GPT_PATH = str(Path(CURRENT_ENGINE.gpt_path).resolve())
+            STARTUP_LOGGER.info("Models ready: resident=%d; active=%s", len(CURRENT_ENGINE.loaded_gpt_checkpoints), CURRENT_GPT_PATH)
             return CURRENT_GPT_PATH
 
         # Runtime-setting changes require rebuilding the shared non-GPT stack.
         # GPT-only changes take the cache path above instead.
-        _release_engine_locked()
+        with timed_stage("Release previous engine and accelerator cache"):
+            _release_engine_locked()
 
-        from indextts.infer_v2_5 import IndexTTS2
+        with timed_stage("Import inference dependencies"):
+            from indextts.infer_v2_5 import IndexTTS2
 
         engine = IndexTTS2(
             cfg_path=config_path,
@@ -160,9 +192,14 @@ def load_model(
         CURRENT_ENGINE = engine
         CURRENT_MODEL_SPEC = model_spec
         CURRENT_GPT_PATH = str(Path(engine.gpt_path).resolve())
+        STARTUP_LOGGER.info(
+            "Models ready: resident=%d; active=%s; generation warmup has not been run",
+            len(engine.loaded_gpt_checkpoints), CURRENT_GPT_PATH,
+        )
         return CURRENT_GPT_PATH
 
 
+@timed_stage("Switch resident GPT checkpoint")
 def switch_model(gpt_checkpoint: str) -> str:
     """Switch to an already resident GPT checkpoint without loading weights."""
     resolved = str(Path(gpt_checkpoint).expanduser().resolve())
@@ -240,6 +277,7 @@ def build_generation_kwargs(
     return {key: value for key, value in values.items() if value is not None}
 
 
+@timed_stage("Generate audio total (including lock wait; excluding encoding)")
 def generate_audio(
     *,
     gpt_checkpoint: Optional[str] = None,
@@ -553,11 +591,12 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--port", type=int, default=9880)
     args = parser.parse_args()
 
-    uvicorn_log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    configure_run_logging()
+    STARTUP_LOGGER.info("Starting API on %s:%s", args.bind_addr, args.port)
     uvicorn.run(
         app=APP,
         host=cast(str, args.bind_addr),
         port=args.port,
         workers=1,
-        log_config=uvicorn_log_config,
+        log_config=None,
     )

@@ -18,11 +18,15 @@ from pathlib import Path
 import torch
 import yaml
 
+from indextts.runtime_logging import timed_stage
+
 
 def load_checkpoint(model: torch.nn.Module, model_pth: str) -> dict:
-    checkpoint = torch.load(model_pth, map_location='cpu')
-    checkpoint = checkpoint['model'] if 'model' in checkpoint else checkpoint
-    missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+    with timed_stage("GPT checkpoint read/deserialization (CPU)"):
+        checkpoint = torch.load(model_pth, map_location='cpu')
+        checkpoint = checkpoint['model'] if 'model' in checkpoint else checkpoint
+    with timed_stage("GPT load_state_dict (CPU)"):
+        missing, unexpected = model.load_state_dict(checkpoint, strict=False)
     if missing:
         print(f">> load_checkpoint: missing keys ({len(missing)}): {missing[:5]}{'...' if len(missing) > 5 else ''}")
     if unexpected:

@@ -1,4 +1,5 @@
 import os
+import logging
 from subprocess import CalledProcessError
 from typing import Iterable
 
@@ -21,6 +22,7 @@ from omegaconf import OmegaConf
 from indextts.codec.models import EnhancedCodec
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.checkpoint import load_checkpoint
+from indextts.runtime_logging import timed_stage
 from indextts.utils.common import save_pcm_wav
 from indextts.utils.front import TextNormalizer
 from indextts.utils.tokenizer import get_tokenizer, lang_to_token
@@ -74,6 +76,9 @@ def apply_pronunciation_annotations(text: str) -> str:
     return PRONUNCIATION_ANNOTATION_PATTERN.sub(_replace, text)
 
 
+LOGGER = logging.getLogger("indextts.startup")
+
+
 class IndexTTS2:
     # The in-repo 2.5 trainer freezes these modules.  Independently produced
     # checkpoints may not, so they are shared only after a bit-exact comparison.
@@ -85,6 +90,7 @@ class IndexTTS2:
         "emo_layer",
     )
 
+    @timed_stage("IndexTTS2 initialization total")
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_bf16=False, device=None,
             use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False, use_qwen_emo=False,
@@ -139,6 +145,7 @@ class IndexTTS2:
         self.use_accel = use_accel
         self.use_torch_compile = use_torch_compile
         self.use_deepspeed = use_deepspeed
+        LOGGER.info("Resolved runtime: device=%s; dtype=%s; cuda_kernel=%s", self.device, self.dtype or torch.float32, self.use_cuda_kernel)
 
         # Detect low-VRAM GPUs (< 10 GB) to enable automatic text chunking
         self.low_vram = False
@@ -150,7 +157,8 @@ class IndexTTS2:
                 print(f">> Low-VRAM mode enabled ({total_vram_gb:.1f} GB < 10 GB), long text will be split into chunks")
 
         if use_qwen_emo:
-            self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
+            with timed_stage("QwenEmotion initialization"):
+                self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
         else:
             self.qwen_emo = None
             print(">> QwenEmotion not loaded (use_qwen_emo=False)")
@@ -163,7 +171,8 @@ class IndexTTS2:
 
         if use_deepspeed:
             try:
-                import deepspeed
+                with timed_stage("Import DeepSpeed"):
+                    import deepspeed
             except (ImportError, OSError, CalledProcessError) as e:
                 use_deepspeed = False
                 print(f">> Failed to load DeepSpeed. Falling back to normal inference. Error: {e}")
@@ -180,7 +189,8 @@ class IndexTTS2:
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
             try:
-                from indextts.s2mel.modules.bigvgan.alias_free_activation.cuda import activation1d
+                with timed_stage("BigVGAN custom CUDA kernel import/build"):
+                    from indextts.s2mel.modules.bigvgan.alias_free_activation.cuda import activation1d
 
                 print(">> Preload custom CUDA kernel for BigVGAN", activation1d.anti_alias_activation_cuda)
             except Exception as e:
@@ -188,92 +198,96 @@ class IndexTTS2:
                 print(f"{e!r}")
                 self.use_cuda_kernel = False
 
-        w2v_bert_dir = os.path.join(self.model_dir, "hf_cache", "w2v-bert-2.0")
-        if not os.path.isdir(w2v_bert_dir):
-            from indextts.utils.model_download import ensure_models_available
-            aux_paths = ensure_models_available(self.model_dir)
-            w2v_bert_dir = aux_paths["w2v_bert"]
-        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(w2v_bert_dir, local_files_only=True)
-        self.semantic_model = Wav2Vec2BertModel.from_pretrained(w2v_bert_dir, local_files_only=True)
-        self.semantic_model = self.semantic_model.to(self.device)
-        self.semantic_model.eval()
-        stat_mean_var = torch.load(os.path.join(self.model_dir, self.cfg.w2v_stat))
-        self.semantic_mean = stat_mean_var["mean"].to(self.device)
-        self.semantic_std = torch.sqrt(stat_mean_var["var"]).to(self.device)
+        with timed_stage("Wav2Vec2-BERT semantic model and feature extractor"):
+            w2v_bert_dir = os.path.join(self.model_dir, "hf_cache", "w2v-bert-2.0")
+            if not os.path.isdir(w2v_bert_dir):
+                from indextts.utils.model_download import ensure_models_available
+                aux_paths = ensure_models_available(self.model_dir)
+                w2v_bert_dir = aux_paths["w2v_bert"]
+            self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(w2v_bert_dir, local_files_only=True)
+            self.semantic_model = Wav2Vec2BertModel.from_pretrained(w2v_bert_dir, local_files_only=True)
+            self.semantic_model = self.semantic_model.to(self.device)
+            self.semantic_model.eval()
+            stat_mean_var = torch.load(os.path.join(self.model_dir, self.cfg.w2v_stat))
+            self.semantic_mean = stat_mean_var["mean"].to(self.device)
+            self.semantic_std = torch.sqrt(stat_mean_var["var"]).to(self.device)
 
-        start_time = time.perf_counter()
-        self.semantic_codec = EnhancedCodec(**self.cfg.semantic_codec, cfg=self.cfg.semantic_codec)
-        codec_ckpt_path = os.path.join(self.model_dir, "codec.pth")
-        self.semantic_codec.load_checkpoint(codec_ckpt_path)
-        print('>> semantic_codec weights restored from:', codec_ckpt_path)
-        self.semantic_codec = self.semantic_codec.to(self.device)
-        print('>> semantic_codec weights restored cost: ', time.perf_counter() - start_time)
+        with timed_stage("Semantic codec initialization"):
+            self.semantic_codec = EnhancedCodec(**self.cfg.semantic_codec, cfg=self.cfg.semantic_codec)
+            codec_ckpt_path = os.path.join(self.model_dir, "codec.pth")
+            self.semantic_codec.load_checkpoint(codec_ckpt_path)
+            print('>> semantic_codec weights restored from:', codec_ckpt_path)
+            self.semantic_codec = self.semantic_codec.to(self.device)
 
-        s2mel_path = os.path.join(self.model_dir, self.cfg.s2mel_checkpoint)
-        s2mel = MyModel(self.cfg.s2mel)
-        s2mel, _, _, _ = load_checkpoint2(
-            s2mel,
-            None,
-            s2mel_path,
-            load_only_params=True,
-            ignore_modules=[],
-            is_distributed=False,
-        )
-        self.s2mel = s2mel.to(self.device)
-        self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+        with timed_stage("S2Mel initialization and cache allocation"):
+            s2mel_path = os.path.join(self.model_dir, self.cfg.s2mel_checkpoint)
+            s2mel = MyModel(self.cfg.s2mel)
+            s2mel, _, _, _ = load_checkpoint2(
+                s2mel,
+                None,
+                s2mel_path,
+                load_only_params=True,
+                ignore_modules=[],
+                is_distributed=False,
+            )
+            self.s2mel = s2mel.to(self.device)
+            self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
 
         # Enable torch.compile optimization if requested
         if self.use_torch_compile:
-            print(">> Enabling torch.compile optimization")
-            self.s2mel.enable_torch_compile()
-            print(">> torch.compile optimization enabled successfully")
+            with timed_stage("S2Mel torch.compile setup (compilation may be deferred to generation)"):
+                self.s2mel.enable_torch_compile()
 
         self.s2mel.eval()
         print(">> s2mel weights restored from:", s2mel_path)
 
         # load campplus_model
-        campplus_ckpt_path = os.path.join(self.model_dir, "hf_cache", "campplus_cn_common.bin")
-        if not os.path.isfile(campplus_ckpt_path):
-            from indextts.utils.model_download import ensure_models_available
-            aux_paths = ensure_models_available(self.model_dir)
-            campplus_ckpt_path = aux_paths["campplus"]
-        campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
-        campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
-        self.campplus_model = campplus_model.to(self.device)
-        self.campplus_model.eval()
-        print(">> campplus_model weights restored from:", campplus_ckpt_path)
+        with timed_stage("CAMPPlus speaker model initialization"):
+            campplus_ckpt_path = os.path.join(self.model_dir, "hf_cache", "campplus_cn_common.bin")
+            if not os.path.isfile(campplus_ckpt_path):
+                from indextts.utils.model_download import ensure_models_available
+                aux_paths = ensure_models_available(self.model_dir)
+                campplus_ckpt_path = aux_paths["campplus"]
+            campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
+            campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
+            self.campplus_model = campplus_model.to(self.device)
+            self.campplus_model.eval()
+            print(">> campplus_model weights restored from:", campplus_ckpt_path)
 
-        bigvgan_dir = os.path.join(self.model_dir, "hf_cache", "bigvgan")
-        if not os.path.isdir(bigvgan_dir):
-            from indextts.utils.model_download import ensure_models_available
-            aux_paths = ensure_models_available(self.model_dir)
-            bigvgan_dir = aux_paths["bigvgan"]
-        self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_dir, use_cuda_kernel=self.use_cuda_kernel)
-        self.bigvgan = self.bigvgan.to(self.device)
-        self.bigvgan.remove_weight_norm()
-        self.bigvgan.eval()
-        print(">> bigvgan weights restored from:", bigvgan_dir)
+        with timed_stage("BigVGAN vocoder initialization"):
+            bigvgan_dir = os.path.join(self.model_dir, "hf_cache", "bigvgan")
+            if not os.path.isdir(bigvgan_dir):
+                from indextts.utils.model_download import ensure_models_available
+                aux_paths = ensure_models_available(self.model_dir)
+                bigvgan_dir = aux_paths["bigvgan"]
+            self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_dir, use_cuda_kernel=self.use_cuda_kernel)
+            self.bigvgan = self.bigvgan.to(self.device)
+            self.bigvgan.remove_weight_norm()
+            self.bigvgan.eval()
+            print(">> bigvgan weights restored from:", bigvgan_dir)
 
-        self.tokenizer = get_tokenizer(multilingual=True, model_dir=self.model_dir)
-        self.ja_text_process = JapaneseG2PProcessor(g2p_ratio=0)
-        self.text_process = TextNormalizer(enable_glossary=True)
-        self.text_process.load()
+        with timed_stage("Tokenizer and text normalization initialization"):
+            self.tokenizer = get_tokenizer(multilingual=True, model_dir=self.model_dir)
+            self.ja_text_process = JapaneseG2PProcessor(g2p_ratio=0)
+            self.text_process = TextNormalizer(enable_glossary=True)
+            self.text_process.load()
 
-        # 加载术语词汇表（如果存在）
-        self.glossary_path = os.path.join(self.model_dir, "glossary.yaml")
-        if os.path.exists(self.glossary_path):
-            self.text_process.load_glossary_from_yaml(self.glossary_path)
-            print(">> Glossary loaded from:", self.glossary_path)
+            # 加载术语词汇表（如果存在）
+            self.glossary_path = os.path.join(self.model_dir, "glossary.yaml")
+            if os.path.exists(self.glossary_path):
+                self.text_process.load_glossary_from_yaml(self.glossary_path)
+                print(">> Glossary loaded from:", self.glossary_path)
 
-        emo_matrix = torch.load(os.path.join(self.model_dir, self.cfg.emo_matrix))
-        self.emo_matrix = emo_matrix.to(self.device)
-        self.emo_num = list(self.cfg.emo_num)
+        with timed_stage("Emotion and speaker matrices"):
+            emo_matrix = torch.load(os.path.join(self.model_dir, self.cfg.emo_matrix))
+            self.emo_matrix = emo_matrix.to(self.device)
+            self.emo_num = list(self.cfg.emo_num)
 
-        spk_matrix = torch.load(os.path.join(self.model_dir, self.cfg.spk_matrix))
-        self.spk_matrix = spk_matrix.to(self.device)
+            spk_matrix = torch.load(os.path.join(self.model_dir, self.cfg.spk_matrix))
+            self.spk_matrix = spk_matrix.to(self.device)
 
-        self.emo_matrix = torch.split(self.emo_matrix, self.emo_num)
-        self.spk_matrix = torch.split(self.spk_matrix, self.emo_num)
+            self.emo_matrix = torch.split(self.emo_matrix, self.emo_num)
+            self.spk_matrix = torch.split(self.spk_matrix, self.emo_num)
 
         mel_fn_args = {
             "n_fft": self.cfg.s2mel['preprocess_params']['spect_params']['n_fft'],
@@ -319,36 +333,42 @@ class IndexTTS2:
         )
 
     def _build_gpt_model(self, checkpoint_path):
-        model = UnifiedVoice(
-            **self.cfg.gpt,
-            use_accel=self.use_accel,
-            spk_cond_mode="campplus",
-        )
-        load_checkpoint(model, checkpoint_path)
-        model = model.to(self.device)
-        if self.use_bf16:
-            model.eval().bfloat16()
-        else:
-            model.eval()
-        print(">> GPT weights restored from:", checkpoint_path)
+        with timed_stage(f"GPT model total: {checkpoint_path}"):
+            with timed_stage("GPT module construction"):
+                model = UnifiedVoice(
+                    **self.cfg.gpt,
+                    use_accel=self.use_accel,
+                    spk_cond_mode="campplus",
+                )
+            load_checkpoint(model, checkpoint_path)
+            with timed_stage(f"GPT device transfer and precision setup ({self.device})"):
+                model = model.to(self.device)
+                if self.use_bf16:
+                    model.eval().bfloat16()
+                else:
+                    model.eval()
+            print(">> GPT weights restored from:", checkpoint_path)
 
-        model.post_init_gpt2_config(
-            use_deepspeed=self.use_deepspeed,
-            kv_cache=True,
-            half=self.use_bf16,
-            accel_dtype=self.dtype,
-            accel_kv_manager=self._shared_accel_kv_manager,
-        )
-        if model.accel_engine is not None:
-            model._standard_gpt_state_shapes = {
-                key: tuple(value.shape)
-                for key, value in model.gpt.state_dict().items()
-                if key != "wte.weight"
-            }
-            if self._shared_accel_kv_manager is None:
-                self._shared_accel_kv_manager = model.accel_engine.kv_manager
-            model.release_standard_transformer_for_accel()
-        self._share_identical_gpt_modules(model)
+            with timed_stage("GPT inference/acceleration engine setup"):
+                model.post_init_gpt2_config(
+                    use_deepspeed=self.use_deepspeed,
+                    kv_cache=True,
+                    half=self.use_bf16,
+                    accel_dtype=self.dtype,
+                    accel_kv_manager=self._shared_accel_kv_manager,
+                )
+            if model.accel_engine is not None:
+                with timed_stage("Release redundant standard GPT transformer"):
+                    model._standard_gpt_state_shapes = {
+                        key: tuple(value.shape)
+                        for key, value in model.gpt.state_dict().items()
+                        if key != "wte.weight"
+                    }
+                    if self._shared_accel_kv_manager is None:
+                        self._shared_accel_kv_manager = model.accel_engine.kv_manager
+                    model.release_standard_transformer_for_accel()
+            with timed_stage("Compare/share bit-identical GPT modules"):
+                self._share_identical_gpt_modules(model)
         return model
 
     def _share_identical_gpt_modules(self, model):
@@ -388,6 +408,7 @@ class IndexTTS2:
         resolved = self._resolve_gpt_checkpoint(checkpoint_path)
         loaded = self._loaded_gpt_path(resolved)
         if loaded is not None:
+            LOGGER.info("GPT checkpoint already resident; skipping load: %s", loaded)
             return loaded
         if self.use_deepspeed:
             raise RuntimeError("multiple resident GPT models are not supported with DeepSpeed")

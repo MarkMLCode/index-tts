@@ -230,6 +230,22 @@ Start it with:
 uv run api.py --bind-addr 127.0.0.1 --port 9880
 ```
 
+Each API process saves timestamped Python output and server logs to
+`logs/<timestamp>_<pid>/api.log` (override the root with `INDEXTTS_API_LOG_DIR`).
+Added diagnostic messages, wall-clock timestamps (including milliseconds), and
+`elapsed=...s` timings appear only in the log file. The console retains the
+original model output, server messages, and API errors. The file includes
+timings for each GPT's construction, checkpoint read,
+weight assignment, device transfer, acceleration setup, and exact module
+sharing, plus the shared speech models and BigVGAN kernel import/build.
+`load_model total` includes validation, model-lock waiting, dependency imports,
+and initialization; it is separate from API application startup. Nested totals
+overlap, so do not add them together. Timings measure host elapsed time without
+adding GPU synchronizations. Native compiler subprocess output may only appear
+in the console, but its elapsed time is included in the kernel stage.
+Generation and explicit model switches also have total timers. This logging
+does not add a warmup generation or change inference settings.
+
 Load one or more GPT checkpoints and choose the main one. When the list contains
 only one checkpoint, `main_gpt_checkpoint` may be omitted:
 

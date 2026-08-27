@@ -139,7 +139,8 @@ def test_unload_model_releases_an_inactive_checkpoint(tmp_path, monkeypatch):
     assert engine.loaded_gpt_checkpoints == ("base.pth",)
 
 
-def test_load_model_reuses_runtime_and_sets_the_exact_resident_set(tmp_path):
+def test_load_model_reuses_runtime_and_sets_the_exact_resident_set(tmp_path, caplog):
+    caplog.set_level("INFO")
     config = tmp_path / "config.yaml"
     checkpoint = tmp_path / "voice.pth"
     config.touch()
@@ -169,6 +170,9 @@ def test_load_model_reuses_runtime_and_sets_the_exact_resident_set(tmp_path):
     assert selected == str(checkpoint.resolve())
     assert api.CURRENT_ENGINE is engine
     assert engine.loaded_gpt_checkpoints == (str(checkpoint.resolve()),)
+    assert "Update resident GPT set (reuse shared speech stack)" in caplog.text
+    assert "Models ready: resident=1" in caplog.text
+    assert "DONE load_model total (including validation and lock wait) | elapsed=" in caplog.text
 
 
 def test_multiple_models_require_a_main_checkpoint(tmp_path):
@@ -202,3 +206,45 @@ def test_main_checkpoint_must_be_in_resident_set(tmp_path):
             gpt_checkpoint_paths=[str(first)],
             main_gpt_checkpoint=str(other),
         )
+
+
+def test_new_runtime_logs_startup_stages_without_warmup(tmp_path, monkeypatch, caplog):
+    import sys
+    from types import SimpleNamespace
+
+    config = tmp_path / "config.yaml"
+    checkpoint = tmp_path / "voice.pth"
+    config.touch()
+    checkpoint.touch()
+    engine = FakeEngine()
+    engine.gpt_path = str(checkpoint.resolve())
+    engine.loaded_gpt_checkpoints = (engine.gpt_path,)
+    monkeypatch.setattr(api, "_release_engine_locked", lambda: None)
+    monkeypatch.setitem(sys.modules, "indextts.infer_v2_5", SimpleNamespace(IndexTTS2=lambda **kwargs: engine))
+    caplog.set_level("INFO")
+
+    assert api.load_model(
+        config=str(config), model_dir=str(tmp_path),
+        gpt_checkpoint_paths=[str(checkpoint)],
+    ) == engine.gpt_path
+
+    assert engine.calls == []
+    assert "DONE Release previous engine and accelerator cache | elapsed=" in caplog.text
+    assert "DONE Import inference dependencies | elapsed=" in caplog.text
+    assert "generation warmup has not been run" in caplog.text
+    assert "DONE load_model total (including validation and lock wait) | elapsed=" in caplog.text
+
+
+def test_api_lifespan_initializes_run_logging(monkeypatch, caplog):
+    import asyncio
+
+    calls = []
+    monkeypatch.setattr(api, "configure_run_logging", lambda: calls.append("configured"))
+    caplog.set_level("INFO")
+
+    async def start_app():
+        async with api.lifespan(api.APP):
+            assert calls == ["configured"]
+
+    asyncio.run(start_app())
+    assert "elapsed_since_api_import=" in caplog.text

@@ -21,6 +21,52 @@ class FakeGPT:
         self.accel_engine = FakeAccelEngine() if accelerated else None
 
 
+def test_gpt_startup_timers_preserve_loaded_weights(tmp_path, monkeypatch, caplog):
+    import importlib
+    from types import SimpleNamespace
+
+    inference = importlib.import_module("indextts.infer_v2_5")
+
+    class TinyGPT(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.layer = nn.Linear(2, 2)
+            self.accel_engine = None
+
+        def post_init_gpt2_config(self, **kwargs):
+            self.inference_options = kwargs
+
+    source = TinyGPT()
+    checkpoint = tmp_path / "voice.pth"
+    torch.save({"model": source.state_dict()}, checkpoint)
+    monkeypatch.setattr(inference, "UnifiedVoice", TinyGPT)
+    runtime = object.__new__(IndexTTS2)
+    runtime.cfg = SimpleNamespace(gpt={})
+    runtime.device = "cpu"
+    runtime.dtype = None
+    runtime.use_accel = False
+    runtime.use_deepspeed = False
+    runtime.use_bf16 = False
+    runtime._shared_accel_kv_manager = None
+    runtime._gpt_models = {}
+    caplog.set_level("INFO", logger="indextts.startup")
+
+    model = runtime._build_gpt_model(str(checkpoint))
+
+    assert not model.training
+    assert model.inference_options["accel_kv_manager"] is None
+    for name, tensor in source.state_dict().items():
+        assert torch.equal(tensor, model.state_dict()[name])
+    for stage in (
+        "GPT module construction", "GPT checkpoint read/deserialization (CPU)",
+        "GPT load_state_dict (CPU)", "GPT device transfer and precision setup (cpu)",
+        "GPT inference/acceleration engine setup", "Compare/share bit-identical GPT modules",
+        f"GPT model total: {checkpoint}",
+    ):
+        assert f"START {stage}" in caplog.text
+        assert f"DONE {stage} | elapsed=" in caplog.text
+
+
 def test_resident_cache_switches_by_reference_and_can_unload(tmp_path):
     base_path = tmp_path / "base.pth"
     voice_path = tmp_path / "voice.pth"
