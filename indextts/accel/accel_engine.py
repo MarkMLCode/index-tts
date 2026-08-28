@@ -3,7 +3,6 @@ import sys
 from typing import List, Optional
 
 import torch
-from torch import nn
 
 from .attention import (
     ForwardContext,
@@ -81,9 +80,6 @@ class AccelInferenceEngine:
                 )
         self.kv_manager = kv_manager
         self.kv_manager.wire_kv_cache_to_model(model)
-        # Sampling is sensitive to logit rounding. Lazily retain an fp32 copy
-        # of the final norm/head when accelerated inference runs in fp16/bf16.
-        self._lm_head_fp32: Optional[nn.Module] = None
         self.current_sequences = []
         self.graphs = {}
         self.graph_vars = None
@@ -239,17 +235,16 @@ class AccelInferenceEngine:
         return temperatures
 
     def _compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Project hidden states in fp32 before applying sampling controls."""
+        """Use the resident head; sampling separately promotes logits to fp32."""
         if self.lm_head is None:
             return self.model.compute_logits(hidden.float())
 
         head_dtype = next(self.lm_head.parameters()).dtype
-        if head_dtype == torch.float32:
-            return self.lm_head(hidden.float())
-
-        if self._lm_head_fp32 is None:
-            self._lm_head_fp32 = copy.deepcopy(self.lm_head).float()
-        return self._lm_head_fp32(hidden.float())
+        # Preserve the original fp32 normalization input under CUDA autocast;
+        # autocast already uses low precision for the final linear projection.
+        # Without autocast, match the resident weights instead of duplicating them.
+        input_dtype = torch.float32 if torch.is_autocast_enabled(hidden.device.type) else head_dtype
+        return self.lm_head(hidden.to(dtype=input_dtype))
 
     def _apply_repetition_penalty(
         self, logits: torch.Tensor, sequences: List[Seq]
@@ -526,13 +521,11 @@ class AccelInferenceEngine:
             [prompt_tokens + best_tokens], dtype=torch.long, device=device
         )
 
-    def reset_model_state(self, *, weights_changed: bool = True) -> None:
+    def reset_model_state(self) -> None:
         """Invalidate state tied to the currently loaded GPT checkpoint."""
         if self.current_sequences:
             raise RuntimeError("cannot reset accelerated model state during generation")
         self.kv_manager.reset()
-        if weights_changed:
-            self._lm_head_fp32 = None
 
     def _capture_cuda_graphs(self, tts_mel_embedding=None, tts_text_pos_embedding=None):
         print("Capturing CUDA graphs for decode optimization...")

@@ -521,7 +521,7 @@ class IndexTTS2:
             loaded = self.preload_gpt_checkpoint(resolved)
         model = self._gpt_models[loaded]
         if model.accel_engine is not None:
-            model.accel_engine.reset_model_state(weights_changed=False)
+            model.accel_engine.reset_model_state()
         self.gpt = model
         self.gpt_path = loaded
         return loaded

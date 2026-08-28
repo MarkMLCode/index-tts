@@ -8,8 +8,8 @@ from indextts.runtime_logging import file_only_output, timed_stage
 def warmup_engine(engine, checkpoint_paths, speaker):
     """Warm each requested GPT plus the shared speech stack; discard the audio.
 
-    The API's model lock must be held throughout. Graphs and immutable head
-    caches are retained; speaker/emotion caches and the active model are restored.
+    The API's model lock must be held throughout. CUDA graphs are retained;
+    speaker/emotion caches and the active model are restored.
     API/WebUI requests reset their seeds before inference, independently of warmup.
     """
     original_path = engine.gpt_path
@@ -43,7 +43,7 @@ def warmup_engine(engine, checkpoint_paths, speaker):
             accel = getattr(getattr(engine, "gpt", None), "accel_engine", None)
             if accel is not None:
                 accel.current_sequences.clear()
-                accel.reset_model_state(weights_changed=False)
+                accel.reset_model_state()
                 from indextts.accel.attention import reset_forward_context
                 reset_forward_context()
             for name, value in reference_cache.items():

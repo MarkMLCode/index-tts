@@ -12,7 +12,7 @@ class FakeAccelEngine:
     def __init__(self):
         self.reset_count = 0
 
-    def reset_model_state(self, *, weights_changed=True):
+    def reset_model_state(self):
         self.reset_count += 1
 
 

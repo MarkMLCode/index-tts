@@ -217,20 +217,55 @@ class AccelSamplingParityTests(unittest.TestCase):
         self.assertEqual(children[0].block_table[-1], original_block)
         self.assertEqual(scores, [0.0])
 
-    def test_half_precision_head_projects_logits_in_float32(self) -> None:
+    def test_head_uses_resident_precision_without_autocast(self) -> None:
         engine = sampling_engine()
-        head = nn.Linear(3, 4, bias=True).half()
-        engine.lm_head = head
-        engine._lm_head_fp32 = None
         hidden = torch.tensor([[0.1234567, -1.234567, 2.345678]], dtype=torch.float32)
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                head = nn.Linear(3, 4, bias=True).to(dtype)
+                engine.lm_head = head
+                actual = engine._compute_logits(hidden)
+                expected = head(hidden.to(dtype))
+                self.assertEqual(actual.dtype, dtype)
+                self.assertTrue(torch.equal(actual, expected))
+                self.assertFalse(hasattr(engine, "_lm_head_fp32"))
 
-        actual = engine._compute_logits(hidden)
-        expected = copy.deepcopy(head).float()(hidden)
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
+    def test_autocast_head_matches_old_fp32_copy(self) -> None:
+        engine = sampling_engine()
+        for dtype in (torch.float16, torch.bfloat16):
+            head = nn.Sequential(nn.LayerNorm(1280), nn.Linear(1280, 8194)).cuda().to(dtype).eval()
+            engine.lm_head = head
+            old_head = copy.deepcopy(head).float()
+            for input_dtype in (dtype, torch.float32):
+                for batch in (1, 3):
+                    with self.subTest(dtype=dtype, input_dtype=input_dtype, batch=batch):
+                        hidden = torch.randn(batch, 1280, device="cuda", dtype=input_dtype)
+                        with torch.no_grad(), torch.autocast("cuda", dtype=dtype):
+                            expected = old_head(hidden.float())
+                            actual = engine._compute_logits(hidden)
+                        self.assertEqual(actual.dtype, dtype)
+                        self.assertTrue(torch.equal(actual, expected))
+                        self.assertIs(engine.lm_head, head)
+                        self.assertFalse(hasattr(engine, "_lm_head_fp32"))
 
-        self.assertEqual(actual.dtype, torch.float32)
-        torch.testing.assert_close(actual, expected)
+    def test_half_logits_are_promoted_for_sampling_and_beam_scoring(self) -> None:
+        engine = sampling_engine()
+        original = engine._apply_repetition_penalty
+        seen = []
 
-    def test_model_reset_invalidates_cached_float32_head(self) -> None:
+        def checked(logits, sequences):
+            seen.append(logits.dtype)
+            return original(logits, sequences)
+
+        engine._apply_repetition_penalty = checked
+        logits = torch.tensor([[3.2, 1.1, -0.4, 2.7]], dtype=torch.bfloat16)
+        sequences = [Seq([1, 3], block_size=8)]
+        engine._sample_tokens(logits.clone(), sequences)
+        engine._beam_candidates(logits, sequences, torch.zeros(1), num_beams=2)
+        self.assertEqual(seen, [torch.float32, torch.float32])
+
+    def test_model_reset_clears_kv_state_but_preserves_graphs_and_head(self) -> None:
         engine = sampling_engine()
 
         class Manager:
@@ -241,23 +276,22 @@ class AccelSamplingParityTests(unittest.TestCase):
 
         engine.current_sequences = []
         engine.kv_manager = Manager()
-        engine._lm_head_fp32 = nn.Linear(2, 2)
+        engine.lm_head = head = nn.Linear(2, 2)
+        engine.graphs = graphs = {1: object()}
+        engine.graph_captured = True
 
         engine.reset_model_state()
 
         self.assertTrue(engine.kv_manager.reset_called)
-        self.assertIsNone(engine._lm_head_fp32)
+        self.assertIs(engine.lm_head, head)
+        self.assertIs(engine.graphs, graphs)
+        self.assertTrue(engine.graph_captured)
 
-    def test_resident_switch_preserves_cached_float32_head(self) -> None:
+    def test_reset_rejects_active_generation(self) -> None:
         engine = sampling_engine()
-        engine.current_sequences = []
-        reset_calls = []
-        engine.kv_manager = type("Manager", (), {"reset": lambda self: reset_calls.append(True)})()
-        head = nn.Linear(2, 2)
-        engine._lm_head_fp32 = head
-        engine.reset_model_state(weights_changed=False)
-        self.assertEqual(reset_calls, [True])
-        self.assertIs(engine._lm_head_fp32, head)
+        engine.current_sequences = [object()]
+        with self.assertRaisesRegex(RuntimeError, "during generation"):
+            engine.reset_model_state()
 
 
 if __name__ == "__main__":
