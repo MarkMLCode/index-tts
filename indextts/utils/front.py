@@ -386,7 +386,9 @@ class TextNormalizer:
             import yaml
             with open(glossary_path, 'r', encoding='utf-8') as f:
                 external_glossary = yaml.safe_load(f)
-                if external_glossary and isinstance(external_glossary, dict):
+                if external_glossary is None:
+                    external_glossary = {}
+                if isinstance(external_glossary, dict):
                     self.term_glossary = external_glossary
                     return True
         return False

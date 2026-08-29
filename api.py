@@ -124,6 +124,21 @@ def _warmup_loaded_models_locked(engine, speaker: Optional[str]) -> None:
         STARTUP_LOGGER.info("Generation warmup already completed for all resident checkpoints")
 
 
+def _load_glossary_locked(engine: Any, glossary_path: str) -> None:
+    """Load a runtime glossary. MODEL_LOCK must be held by the caller."""
+    text_process = getattr(engine, "text_process", None)
+    loader = getattr(text_process, "load_glossary_from_yaml", None)
+    if not callable(loader):
+        raise RuntimeError("the loaded engine does not support glossary overrides")
+    if not loader(glossary_path):
+        raise ValueError("glossary YAML must contain a mapping at its top level")
+    STARTUP_LOGGER.info(
+        "Loaded runtime glossary with %d term(s) from %s",
+        len(text_process.term_glossary),
+        glossary_path,
+    )
+
+
 @timed_stage("load_model total (including validation and lock wait)")
 def load_model(
     *,
@@ -138,6 +153,7 @@ def load_model(
     use_accel: bool = False,
     use_torch_compile: bool = False,
     use_qwen_emo: bool = False,
+    glossary_path: Optional[str] = None,
     warmup: bool = True,
     warmup_speaker: Optional[str] = None,
 ) -> str:
@@ -178,6 +194,11 @@ def load_model(
         use_accel,
         use_torch_compile,
         use_qwen_emo,
+    )
+    resolved_glossary_path = (
+        _resolve_existing_file(glossary_path, "glossary file")
+        if glossary_path is not None
+        else None
     )
     resolved_warmup_speaker = _resolve_warmup_speaker(warmup_speaker) if warmup else None
 
@@ -221,6 +242,8 @@ def load_model(
             )
             CURRENT_ENGINE = engine
             CURRENT_MODEL_SPEC = model_spec
+        if resolved_glossary_path is not None:
+            _load_glossary_locked(engine, resolved_glossary_path)
         CURRENT_GPT_PATH = str(Path(engine.gpt_path).resolve())
         _warmup_loaded_models_locked(engine, resolved_warmup_speaker)
         STARTUP_LOGGER.info(
@@ -452,6 +475,7 @@ class LoadModelRequest(APIRequest):
     use_accel: bool = False
     use_torch_compile: bool = False
     use_qwen_emo: bool = False
+    glossary_path: Optional[str] = None
     warmup: bool = True
     warmup_speaker: Optional[str] = None
 

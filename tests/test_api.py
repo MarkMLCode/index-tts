@@ -312,6 +312,82 @@ def test_load_model_reuses_runtime_and_sets_the_exact_resident_set(tmp_path, cap
     assert "DONE load_model total (including validation and lock wait) | elapsed=" in caplog.text
 
 
+def test_load_model_replaces_glossary_from_yaml_when_reusing_runtime(tmp_path, caplog):
+    from types import SimpleNamespace
+
+    config = tmp_path / "config.yaml"
+    checkpoint = tmp_path / "voice.pth"
+    glossary = tmp_path / "custom-glossary.yaml"
+    config.touch()
+    checkpoint.touch()
+    glossary.write_text('NVMe:\n  en: "N-V-M-E"\n', encoding="utf-8")
+    engine = FakeEngine()
+    loaded_glossaries = []
+
+    def load_glossary(path):
+        loaded_glossaries.append(path)
+        engine.text_process.term_glossary = {"NVMe": {"en": "N-V-M-E"}}
+        return True
+
+    engine.text_process = SimpleNamespace(
+        term_glossary={"from-file": "old"},
+        load_glossary_from_yaml=load_glossary,
+    )
+    api.CURRENT_ENGINE = engine
+    api.CURRENT_MODEL_SPEC = (
+        str(config.resolve()),
+        str(tmp_path.resolve()),
+        None,
+        False,
+        None,
+        False,
+        False,
+        False,
+        False,
+    )
+    caplog.set_level("INFO")
+
+    api.load_model(
+        config=str(config),
+        model_dir=str(tmp_path),
+        gpt_checkpoint_paths=[str(checkpoint)],
+        glossary_path=str(glossary),
+        warmup=False,
+    )
+
+    assert loaded_glossaries == [str(glossary.resolve())]
+    assert engine.text_process.term_glossary == {"NVMe": {"en": "N-V-M-E"}}
+    assert "Loaded runtime glossary with 1 term(s)" in caplog.text
+    assert str(glossary.resolve()) in caplog.text
+
+
+def test_load_model_request_accepts_dynamic_glossary_path():
+    request = api.LoadModelRequest(
+        gpt_checkpoint_paths=["voice.pth"],
+        glossary_path="glossaries/customer.yaml",
+    )
+
+    assert request.glossary_path == "glossaries/customer.yaml"
+
+
+def test_missing_glossary_path_fails_before_changing_engine(tmp_path):
+    config = tmp_path / "config.yaml"
+    checkpoint = tmp_path / "voice.pth"
+    config.touch()
+    checkpoint.touch()
+
+    with pytest.raises(FileNotFoundError, match="glossary file"):
+        api.load_model(
+            config=str(config),
+            model_dir=str(tmp_path),
+            gpt_checkpoint_paths=[str(checkpoint)],
+            glossary_path=str(tmp_path / "missing.yaml"),
+            warmup=False,
+        )
+
+    assert api.CURRENT_ENGINE is None
+
+
 def test_multiple_models_require_a_main_checkpoint(tmp_path):
     config = tmp_path / "config.yaml"
     first = tmp_path / "first.pth"

@@ -230,12 +230,18 @@ only one checkpoint, `main_gpt_checkpoint` may be omitted:
 ```bash
 curl -X POST http://127.0.0.1:9880/load_model \
   -H "Content-Type: application/json" \
-  -d '{"model_dir":"checkpoints","config":"checkpoints/config.yaml","use_bf16":true,"gpt_checkpoint_paths":["_trained/voice-a.pth","_trained/voice-b.pth"],"main_gpt_checkpoint":"_trained/voice-a.pth"}'
+  -d '{"model_dir":"checkpoints","config":"checkpoints/config.yaml","use_bf16":true,"gpt_checkpoint_paths":["_trained/voice-a.pth","_trained/voice-b.pth"],"main_gpt_checkpoint":"_trained/voice-a.pth","glossary_path":"glossaries/customer.yaml"}'
 ```
 
 Loading warms up each new model by default. Use `warmup_speaker` to specify
 reference audio, or `warmup: false` to skip (also use these if default warmup
 audio is unavailable). DeepSpeed does not support multi-model loading.
+The optional `glossary_path` points to a YAML glossary file and replaces the
+active in-memory glossary after the model is loaded, including when the shared
+runtime is reused. Omit it to retain the glossary loaded from
+`model_dir/glossary.yaml` (or the current runtime glossary). An empty YAML
+mapping (`{}`) clears the glossary. Glossary overrides apply to every resident
+GPT checkpoint because text normalization is shared.
 
 Switch to a preloaded checkpoint:
 
@@ -441,6 +447,16 @@ for English phonemes.
 He had a <minute|M IH1 . N AH0 T> to examine the <minute|M AY0 . N UW1 T> details of the contract.
 
 彼は料理が<上手|じょうず>だが、囲碁では<上手|うわて>に負けた。
+```
+
+For automatic pronunciation overrides in IndexTTS2.5, add entries to
+`glossary.yaml` in the model directory (normally `checkpoints/glossary.yaml`):
+
+```yaml
+volumes:
+  en: "<volumes|V AA1 L . Y UW0 M Z>"
+completely:
+  en: "<completely|K AH0 M . P L IY1 T . L IY0>"
 ```
 
 **IndexTTS2 — Pinyin:**

@@ -1,0 +1,3 @@
+# IndexTTS 2.5 pronunciation overrides (CMU phonemes).
+# Restart the API/WebUI after editing; keep text normalization enabled.
+# Explicit <word|pronunciation> annotations in input text take precedence.

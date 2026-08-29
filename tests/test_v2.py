@@ -176,6 +176,75 @@ def test_modelscope_single_file_download_matches_local_path(tmp_path, monkeypatc
     assert local_path.read_bytes() == expected_bytes
 
 
+# -- Pronunciation glossary (no GPU) -----------------------------------------
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (
+            "It speaks volumes about kindness.",
+            "It speaks <volumes|V AA1 L . Y UW0 M Z> about kindness.",
+        ),
+        (
+            "It leaves me COMPLETELY enthralled and inspired.",
+            "It leaves me <completely|K AH0 M . P L IY1 T . L IY0> enthralled and inspired.",
+        ),
+        (
+            "<volumes|V AA1 L Y AH0 M Z> and completely.",
+            "<volumes|V AA1 L Y AH0 M Z> and <completely|K AH0 M . P L IY1 T . L IY0>.",
+        ),
+        ("Incompletely and myvolumes.", "Incompletely and myvolumes."),
+        (
+            "<行|XING2>和读音",
+            "<行|XING2>和<行|HANG2>",
+        ),
+    ],
+)
+def test_glossary_pronunciations_survive_normalization(text, expected, tmp_path):
+    import re
+
+    from indextts.utils.front import TextNormalizer
+
+    glossary = tmp_path / "glossary.yaml"
+    glossary.write_text(
+        'volumes:\n  en: "<volumes|V AA1 L . Y UW0 M Z>"\n'
+        'completely:\n  en: "<completely|K AH0 M . P L IY1 T . L IY0>"\n'
+        '读音:\n  zh: "<行|HANG2>"\n',
+        encoding="utf-8",
+    )
+    normalizer = TextNormalizer(enable_glossary=True)
+    normalizer.load_glossary_from_yaml(str(glossary))
+    # Mimic a TN engine spelling out digits: phoneme stress/tone markers must
+    # never reach it, whether supplied explicitly or inserted by the glossary.
+    engine = types.SimpleNamespace(normalize=lambda value: re.sub(r"\d", "number", value))
+    normalizer.en_normalizer = normalizer.zh_normalizer = engine
+    assert normalizer.normalize(text) == expected
+
+
+def test_glossary_can_be_disabled_and_keeps_plain_text_readings():
+    from indextts.utils.front import TextNormalizer
+
+    normalizer = TextNormalizer(enable_glossary=True)
+    normalizer.load_glossary({"NVMe": {"en": "N-V-M-E"}, "volumes": {"en": "<volumes|V AA1 L Y UW0 M Z>"}})
+    engine = types.SimpleNamespace(normalize=lambda value: value)
+    normalizer.en_normalizer = normalizer.zh_normalizer = engine
+    assert normalizer.normalize("NVMe volumes") == "N-V-M-E <volumes|V AA1 L Y UW0 M Z>"
+    normalizer.enable_glossary = False
+    assert normalizer.normalize("NVMe volumes") == "NVMe volumes"
+
+
+def test_empty_glossary_yaml_clears_existing_terms(tmp_path):
+    from indextts.utils.front import TextNormalizer
+
+    glossary = tmp_path / "glossary.yaml"
+    glossary.write_text("{}\n", encoding="utf-8")
+    normalizer = TextNormalizer(enable_glossary=True)
+    normalizer.term_glossary = {"NVMe": {"en": "N-V-M-E"}}
+
+    assert normalizer.load_glossary_from_yaml(str(glossary)) is True
+    assert normalizer.term_glossary == {}
+
+
 # -- Text segmentation (no GPU) -----------------------------------------------
 
 def _splitter_stub():
