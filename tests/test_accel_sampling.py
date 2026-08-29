@@ -294,5 +294,67 @@ class AccelSamplingParityTests(unittest.TestCase):
             engine.reset_model_state()
 
 
+class StandardBeamSamplingTests(unittest.TestCase):
+    def test_regular_distribution_preserves_seeded_multinomial_results(self):
+        from indextts.gpt.transformers_generation_utils import _sample_beam_tokens
+
+        scores = torch.tensor([[0.0, -0.5, -1.0, -1.5], [-1.5, -1.0, -0.5, 0.0]])
+        torch.manual_seed(123)
+        expected = torch.multinomial(torch.softmax(scores, dim=-1), num_samples=3)
+        torch.manual_seed(123)
+        actual = _sample_beam_tokens(scores, 3)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_underflow_sampling_keeps_distinct_finite_candidates(self):
+        from indextts.gpt.transformers_generation_utils import _sample_beam_tokens
+
+        scores = torch.tensor([[0.0, -150.0, -200.0, -1e9, -torch.inf]])
+        selected = _sample_beam_tokens(scores, 4)
+        self.assertEqual(set(selected[0].tolist()), {0, 1, 2, 3})
+
+    def test_invalid_scores_fail_before_multinomial(self):
+        from unittest.mock import patch
+
+        from indextts.gpt.transformers_generation_utils import _sample_beam_tokens
+
+        for row in ([0.0, torch.nan], [0.0, torch.inf], [-torch.inf, -torch.inf]):
+            with self.subTest(row=row), patch('torch.multinomial') as sampler:
+                with self.assertRaisesRegex(RuntimeError, 'invalid probabilities'):
+                    _sample_beam_tokens(torch.tensor([row]), 2)
+                sampler.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, 'fewer finite candidates'):
+            _sample_beam_tokens(torch.tensor([[0.0, -torch.inf]]), 2)
+
+    def test_peaked_eos_distribution_does_not_leave_all_beams_masked(self):
+        from transformers import GPT2Config, GPT2Model
+
+        from indextts.gpt.model_v2 import GPT2InferenceModel, LearnedPositionEmbeddings
+
+        config = GPT2Config(n_layer=1, n_head=1, n_embd=8, n_positions=32, vocab_size=8194)
+        model = GPT2InferenceModel(
+            config, GPT2Model(config), LearnedPositionEmbeddings(32, 8),
+            nn.Embedding(8194, 8), nn.LayerNorm(8), nn.Linear(8, 8194), kv_cache=True,
+        ).eval()
+        model.store_mel_emb(torch.zeros(1, 1, 8))
+
+        def peaked_logits(module, inputs, output):
+            # Finite logits, but the only non-EOS alternative underflows after
+            # temperature scaling. Sampling six tokens used to select masked
+            # candidates and poison the next step with all -inf beam scores.
+            output.logits.fill_(-1000.0)
+            output.logits[..., 20] = -30.0
+            output.logits[..., 8193] = 0.0
+
+        model.register_forward_hook(peaked_logits)
+        torch.manual_seed(0)
+        result = model.generate(
+            torch.tensor([[1, 8192]]), attention_mask=torch.ones(1, 2, dtype=torch.long),
+            do_sample=True, num_beams=3, temperature=0.2, top_p=0.95, top_k=30,
+            bos_token_id=8192, eos_token_id=8193, pad_token_id=8193,
+            max_new_tokens=5,
+        )
+        self.assertEqual(result[0, -1].item(), 8193)
+
+
 if __name__ == "__main__":
     unittest.main()

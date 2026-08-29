@@ -140,13 +140,14 @@ class TextNormalizer:
 
     G2P_PRONUNCIATION_ANNOTATION_PATTERN = re.compile(r'<([^|>\n]+)\|([^>\n]+)>')
 
-    def _protect_pronunciation_annotations(self, text: str):
+    def _protect_pronunciation_annotations(self, text: str, placeholders=None):
         """
         在 normalize 之前调用：将 <字|读音> 标注替换为纯字母占位符，
         防止 normalizer 把标注内的数字/符号展开（如 XING2 -> XING二）。
         返回 (替换后文本, 占位符字典)。
         """
-        placeholders = {}
+        if placeholders is None:
+            placeholders = {}
         def _idx_to_alpha(n):
             s = ''
             while True:
@@ -176,11 +177,16 @@ class TextNormalizer:
             return ""
         # 保护 G2P 发音标注 <word|pronunciation>，防止被 normalizer 破坏
         text, _pron_placeholders = self._protect_pronunciation_annotations(text)
-        if self.use_chinese(text):
+        use_chinese = self.use_chinese(text)
+        if self.enable_glossary:
+            text = self.apply_glossary_terms(text, lang="zh" if use_chinese else "en")
+            # Glossary readings may introduce annotations too. Keep explicit
+            # annotations authoritative and protect both sets with unique keys.
+            text, _pron_placeholders = self._protect_pronunciation_annotations(
+                text, _pron_placeholders
+            )
+        if use_chinese:
             text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
-            # 应用术语词汇表（优先级最高，在所有保护之前）
-            if self.enable_glossary:
-                text = self.apply_glossary_terms(text, lang="zh")
             # 保护技术术语（如 GPT-5-nano）避免被中文normalizer错误处理
             replaced_text, tech_list = self.save_tech_terms(text.rstrip())
             replaced_text, pinyin_list = self.save_pinyin_tones(replaced_text)
@@ -202,9 +208,6 @@ class TextNormalizer:
         else:
             try:
                 text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
-                # 应用术语词汇表（优先级最高，在所有保护之前）
-                if self.enable_glossary:
-                    text = self.apply_glossary_terms(text, lang="en")
                 # 保护技术术语（如 GPT-5-Nano）避免被英文normalizer错误处理
                 replaced_text, tech_list = self.save_tech_terms(text)
                 result = self.en_normalizer.normalize(replaced_text)
@@ -328,7 +331,12 @@ class TextNormalizer:
         sorted_terms = sorted(self.term_glossary.keys(), key=len, reverse=True)
         @lru_cache(maxsize=42)
         def get_term_pattern(term: str):
-            return re.compile(re.escape(term), re.IGNORECASE)
+            pattern = re.escape(term)
+            if re.fullmatch(r"[A-Za-z]+", term):
+                # English words must not rewrite substrings (e.g. completely
+                # inside incompletely), or the protected annotation keys.
+                pattern = rf"(?<![A-Za-z0-9_]){pattern}(?![A-Za-z0-9_])"
+            return re.compile(pattern, re.IGNORECASE)
         transformed_text = text
         for term in sorted_terms:
             term_value = self.term_glossary[term]
@@ -338,7 +346,7 @@ class TextNormalizer:
                 replacement = term_value
             # 使用正则进行大小写不敏感的替换
             pattern = get_term_pattern(term)
-            transformed_text = pattern.sub(replacement, transformed_text)
+            transformed_text = pattern.sub(lambda match: replacement, transformed_text)
 
         return transformed_text
 

@@ -328,6 +328,34 @@ GenerateBeamOutput = Union[GenerateBeamDecoderOnlyOutput, GenerateBeamEncoderDec
 GenerateOutput = Union[GenerateNonBeamOutput, GenerateBeamOutput]
 
 
+def _sample_beam_tokens(scores: torch.Tensor, num_samples: int) -> torch.LongTensor:
+    """Sample distinct beam candidates without selecting softmax-underflow zeros."""
+    probabilities = nn.functional.softmax(scores, dim=-1)
+    if not torch.isfinite(probabilities).all().item():
+        # Do not let multinomial raise a device-side assertion, which makes the
+        # CUDA context unusable for subsequent requests in a persistent server.
+        raise RuntimeError(
+            "GPT beam sampling received invalid probabilities (NaN/Inf or all "
+            "candidates masked). Check model outputs and generation settings."
+        )
+    if ((probabilities > 0).sum(dim=-1) >= num_samples).all().item():
+        # Preserve existing seeded results for ordinary distributions.
+        return torch.multinomial(probabilities, num_samples=num_samples)
+
+    # Low temperature, filtering, or the initial -1e9 beam scores can leave
+    # fewer positive probabilities than requested samples. Multinomial then
+    # picks arbitrary zero-probability entries, including masked (-inf) tokens.
+    # At EOS this can leave every live beam at -inf and cause NaNs next step.
+    # The same exponential-race sampler in log space retains tiny candidates.
+    if (torch.isfinite(scores).sum(dim=-1) < num_samples).any().item():
+        raise RuntimeError(
+            "GPT beam sampling has fewer finite candidates than required. "
+            "Relax token filtering or reduce num_beams."
+        )
+    noise = torch.empty_like(scores).exponential_().clamp_min_(torch.finfo(scores.dtype).tiny)
+    return torch.topk(scores - noise.log(), num_samples, dim=-1).indices
+
+
 class GenerationMixin:
     """
     A class containing all functions for auto-regressive text generation, to be used as a mixin in [`PreTrainedModel`].
@@ -3511,8 +3539,7 @@ class GenerationMixin:
             if do_sample:
                 # import time
                 # start = time.time()
-                probs = nn.functional.softmax(next_token_scores, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=n_tokens_to_keep)
+                next_tokens = _sample_beam_tokens(next_token_scores, n_tokens_to_keep)
                 next_token_scores = torch.gather(next_token_scores, -1, next_tokens)
                 next_token_scores, _indices = torch.sort(next_token_scores, descending=True, dim=1)
                 next_tokens = torch.gather(next_tokens, -1, _indices)
